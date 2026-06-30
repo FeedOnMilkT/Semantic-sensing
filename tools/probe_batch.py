@@ -16,7 +16,7 @@ from src.engine import Trainer
 CFG = "configs/cityscapes_seg.yaml"
 OVERRIDES = [
     "model.backbone.name=rtformer",
-    "model.backbone.args.pretrained=/data/sidney/checkpoints/pretrained/rtformer_in1k.pth",
+    "model.backbone.args.pretrained=/data/sidney/checkpoints/semantic-sensing/pretrained/rtformer_in1k.pth",
 ]
 DEVICE = "cuda"
 STEPS = 20

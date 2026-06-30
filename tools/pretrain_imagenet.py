@@ -10,7 +10,7 @@ Launch (4 GPUs, batch is PER-GPU):
   HF_HOME=/data/sidney/hf-cache CUDA_VISIBLE_DEVICES=0,1,4,5 \
     torchrun --nproc_per_node=4 --master_port=29701 tools/pretrain_imagenet.py \
     --epochs 100 --batch-size 512 --lr 2e-3 --resume \
-    --out /data/sidney/checkpoints/pretrained/rtformer_in1k.pth
+    --out /data/sidney/checkpoints/semantic-sensing/pretrained/rtformer_in1k.pth
 """
 import argparse
 import math
@@ -126,7 +126,7 @@ def main():
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--snapshot-every", type=int, default=0,
                     help="if >0, also keep a permanent backbone snapshot every N epochs")
-    ap.add_argument("--out", default="/data/sidney/checkpoints/pretrained/rtformer_in1k.pth")
+    ap.add_argument("--out", default="/data/sidney/checkpoints/semantic-sensing/pretrained/rtformer_in1k.pth")
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
     ckpt_path = os.path.splitext(args.out)[0] + ".last.pth"
