@@ -98,6 +98,20 @@ f --g_a(analysis)--> y --EntropyBottleneck(量化+学习rate)--> y_hat --g_s(syn
     **−0.028 / ~9% 相对，仅训 1 epoch**）。**整条真实管道端到端验证通过。**
     ckpt: `students/late_b0.001_sanity.pth`。
   - 注：`--epochs` 默认 1，所以 `--max-steps 10000` 被 1 epoch（2526 步）截断；要更多步设 `--epochs`。
-- **③ early 的 s4 旁路码率计入**：使 early/late 公平可比（只影响 early；late 本来就全额计 bit）。
-  画最终对比图前做。
-- 各跑 β 扫描 → 两条 bpp-mIoU 曲线 + 部署对比表（送端是否含注意力）。
+- ✅ **③ early 的 s4 旁路码率计入（done, 2026-06-30）**：`student.compress_s4: true` 给 early 加第二个
+  hyperprior 压 s4，bpp 计入两路。三方对照（β=0.001，1 epoch，val-128，teacher 上界 mIoU 0.334）：
+
+  | split | bpp | mIoU | 备注 |
+  |---|---|---|---|
+  | late | 1.467 | 0.306 | 语义腰 |
+  | early（s4 免费，低估） | 0.414 | 0.283 | 旧 |
+  | early（s4 计入，**公平**） | **1.272** | 0.302 | ckpt `early_b0.001_fair.pth` |
+
+  **发现**：s4 一计入，early bpp 0.41→1.27（×3.1）——"early 便宜 3.5×"是 s4 免费的假象。公平比下
+  **early ≈ late**（1.27/0.302 vs 1.47/0.306），bpp-mIoU 基本打平 → **early vs late 的取舍落在部署轴
+  （纯卷积送端）而非码率**。Caveat：单点/1 epoch/子集，且 s4 bottleneck 未调（1.27 还能再压）。
+
+## 真正的下一步（出可发表的结论）
+- **β 扫描**：late 与 early 各扫 β∈{0.002,0.005,0.01,0.02,0.05}，训到收敛、全 val，画两条 bpp-mIoU 曲线。
+- s4 bottleneck 调参（latent/num_down），让 early 曲线公平且最优。
+- 部署对比表：送端 FLOPs/params + 注意力在哪端（early 纯卷积 vs late 含注意力）。
