@@ -51,9 +51,42 @@ f --g_a(analysis)--> y --EntropyBottleneck(量化+学习rate)--> y_hat --g_s(syn
 | #3 框架集成：`build_model(compression)` 前向 + 暴露 `bottleneck_info` | ✅ |
 | #4 真 bitstream roundtrip + 估计 bpp ≈ 实测 | **max\|diff\|=0**，est 3.585 vs 实测 3.776（5.1%）✅ |
 
-## 下一步（未做，Phase 2 训练）
+---
 
-- 把 rate 项 + aux 优化器接进 seg `Trainer`（目前 `Trainer` 只跑任务 loss，不加 β·bpp）。
-- 定 teacher：用 `ade20k_rtformer_bs32_lr4e4`（38.2）作冻结单任务 seg teacher（选项 A）。
-- β 扫描出 rate-distortion / bpp-mIoU 曲线。
-- 真实切分点对齐 RTFormer stage3（当前 student 冒烟用的是 neck 融合特征作通用验证）。
+# 更新（2026-06-30 续）：两个 split student + 完全版 hyperprior bottleneck
+
+为 split-point ablation 构建了**早切/晚切两版 student** + **完整 mean-scale hyperprior**，
+全部走模块化 + 配置文件，未破坏源网络拓扑。
+
+## 新增/改动
+- `src/models/bottlenecks/hyperprior.py`：**完全版** bottleneck。mean-scale 超先验
+  `g_a→h_a→EB(z)→h_s→(μ,σ)→GaussianConditional(y)→g_s`，两路 bitstream。全 conv+BN+ReLU
+  （Hailo 可折叠），**不带 autoregressive context**（不可部署）→ "可部署范围内最优"。工厂注册
+  `hyperprior`（compressai 惰性导入）。
+- `src/models/backbones/rtformer.py`：**无损重构** `forward()` 为 `forward_sender`
+  (stem+s1+s2 纯卷积) + `forward_receiver` (s3~5+DAPPM)。`forward()` 行为不变
+  （断言 `forward == forward_receiver(forward_sender)`，**max|diff|=0**）。
+- `src/models/student.py`：配置驱动 `SplitStudent`，冻结 teacher + 可训 bottleneck，
+  `split=early|late`。
+- `configs/student_rtformer_{early,late}.yaml`：同 teacher、同 bottleneck，**只切点不同**。
+- `tools/smoke_student_split.py`：**9/9 通过**（重构等价 + identity-student==teacher 接线无损
+  + RD 训练下降 + hyperprior 两路 bitstream roundtrip **精确 max|diff|=0** + bpp 误差 <2.5%）。
+
+## 两版定义（受控：唯一变量=切点）
+- **late（语义腰）**：切 neck 输出（单张融合特征）。送端=backbone+neck，收端=decoder+head。
+- **early（纯卷积送端）**：切 stage2 特征（双分辨率分叉前）。送端=stem+s1+s2（纯卷积，注意力全在收端）。
+  收端=s3~5+DAPPM+neck+decoder+head。**s4 高分旁路**（开放问题#1），只压语义的 stage2 特征。
+
+## ⚠️ 两个必须记住的 caveat
+1. **early 的 bpp 被低估**：s4 旁路目前**不计 rate**。smoke 里 early bpp 看着比 late 低，是因为
+   ① 压的特征更小 + ② s4 没算钱。**这不是结论**（且权重是随机的）。要公平比，得把 s4 也压（多尺度
+   bottleneck）或显式把旁路码率计入。
+2. **GPU 段错误**：compressai 的 rANS 原生编码器和 CUDA 上下文同进程混用会 segfault（range coder
+   本就 CPU-only）。**训练 forward/backward 在 GPU 正常**（已单独验证）；**compress/decompress 走 CPU**。
+   smoke 整体固定 CPU。
+
+## 下一步（Phase 2 训练）
+- 把 rate 项 + aux 优化器接进 `Trainer`（目前只跑 task loss）。
+- 载入真 teacher `ade20k_rtformer_bs32_lr4e4`(38.2) 冻结（选项 A）；当前 smoke 用随机权重只验接线。
+- 解决 early 的 s4 旁路码率计入，使 early/late bpp 可公平比。
+- 各跑 β 扫描 → 两条 bpp-mIoU 曲线 + 部署对比表（送端是否含注意力）。
