@@ -27,9 +27,10 @@
 2. **YAML 拼装网络**。OmegaConf 读 YAML，`_base_` + override 合并（按文件自身目录解析）。
    一个顶层 `build_model(cfg)` / `MultiTaskNet(cfg)` 完全按 cfg 装配。
 3. **纯 PyTorch**。手写训练 loop，不用 Lightning、不把 MMSeg 当主框架。
-4. **保留 bottleneck 空槽**。`neck` 与 `decoder` 之间的 `bottleneck` 槽，当前默认 `identity`(no-op)；
-   Phase 2 把 CompressAI `EntropyBottleneck` 塞进这里（真正实现在 `demo/bottleneck-demo/demo2/`，
-   开 Phase 2 时迁入），框架无需重构。
+4. **bottleneck 槽（统一契约 `forward(f) -> (f_hat, info)`）**。`neck` 与 `decoder` 之间：
+   `identity`(no-op，info=None，seg 默认) / `compression`(Phase 2 通信 bottleneck——学习式
+   g_a/g_s + CompressAI `EntropyBottleneck`，已实现于 `src/models/bottlenecks/compression.py`)。
+   CompressAI **惰性导入**（仅建 compression 时才 import），seg 训练零依赖。
 5. **力求简洁**，达目标即停，不过度工程、不追 SOTA。
 
 ## 无注册表的工厂模式
@@ -72,8 +73,8 @@ semantic-sensing/
   CLAUDE.md            本文件
   instruction.md       项目主知识文档（背景/系统分工/Phase 计划/相关工作）
   src/
-    models/  backbones/(rtformer*主用 / mit_b0 / topformer搁置)  necks/  bottlenecks/(identity 槽)
-             decoders/  heads/  multitask_net.py
+    models/  backbones/(rtformer*主用 / mit_b0 / topformer搁置)  necks/
+             bottlenecks/(identity 空槽 / compression=Phase2 通信bottleneck)  decoders/  heads/  multitask_net.py
     datasets/(ade20k*主用 / cityscapes / synthetic)  losses/  engine/(trainer,evaluator)  utils/
   configs/
     base.yaml  ade20k_rtformer{,_bs32_lr4e4,_paperhead}.yaml  cityscapes_seg.yaml   ← 活跃
@@ -107,7 +108,8 @@ teacher 的唯一高 ROI 动作是补/换预训练，且应在跑最终蒸馏数
 
 ```bash
 cd /workspace/semantic-sensing
-python tools/smoke_test.py                      # 框架 import + 前向/训练 sanity
+python tools/smoke_test.py                      # 框架 import + 前向/训练 sanity（seg，5/5）
+python tools/smoke_student.py                   # Phase2 通信 bottleneck student 冒烟（4/4）
 # 主线训练（避开故障 GPU2；batch_size 为 per-GPU）：
 CUDA_VISIBLE_DEVICES=1,3,4,5 torchrun --nproc_per_node=4 tools/train.py \
   configs/ade20k_rtformer.yaml --out /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer.pth
