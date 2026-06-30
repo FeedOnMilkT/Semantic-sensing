@@ -42,6 +42,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--task-weight", type=float, default=0.0, help=">0 adds task loss (ICM arm)")
+    ap.add_argument("--batch-size", type=int, default=None, help="override per-step batch size")
+    ap.add_argument("--val-limit", type=int, default=None, help="eval on first N val images (sanity speed)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--smoke", action="store_true", help="synthetic data + random teacher (wiring check)")
     ap.add_argument("--no-eval", action="store_true")
@@ -72,8 +74,15 @@ def main():
         train_loader = DataLoader(ds, batch_size=2, shuffle=True, collate_fn=collate)
         val_loader = DataLoader(ds, batch_size=2, shuffle=False, collate_fn=collate)
     else:
-        train_loader = make_loader(cfg.data.train, cfg.train.get("batch_size", 8), shuffle=True)
-        val_loader = make_loader(cfg.data.val, cfg.eval.get("batch_size", 4), shuffle=False)
+        bs = args.batch_size or cfg.train.get("batch_size", 8)
+        train_loader = make_loader(cfg.data.train, bs, shuffle=True)
+        if args.val_limit:                                # fast, teacher-comparable sanity eval
+            from torch.utils.data import Subset
+            from src.datasets import build_dataset
+            vds = Subset(build_dataset(cfg.data.val), range(args.val_limit))
+            val_loader = DataLoader(vds, batch_size=4, shuffle=False, collate_fn=collate)
+        else:
+            val_loader = make_loader(cfg.data.val, cfg.eval.get("batch_size", 4), shuffle=False)
 
     # ---- train ----
     tcfg = OmegaConf.create({
