@@ -22,15 +22,19 @@ class MultiTaskNet(nn.Module):
         super().__init__()
         self.backbone = build_backbone(cfg.backbone)
         self.neck = build_neck(cfg.neck, in_channels=self.backbone.out_channels)
-        self.bottleneck = build_bottleneck(cfg.bottleneck)            # demo1: identity
+        self.bottleneck = build_bottleneck(cfg.bottleneck, in_channels=self.neck.out_channels)
         self.decoder = build_decoder(cfg.decoder, in_channels=self.neck.out_channels)
         self.heads = nn.ModuleDict(
             {t: build_head(h, in_channels=self.decoder.out_channels) for t, h in cfg.heads.items()})
+        # populated each forward; consumed by Phase-2 training (distillation target + rate)
+        self.neck_feature = None      # pre-bottleneck feature = the split point
+        self.bottleneck_info = None   # identity: None; compression: {"likelihoods", "latent"}
 
     def forward(self, x, tasks=None):
         feats = self.backbone(x)          # dict {"s4","s8","s16","s32"}
         f = self.neck(feats)
-        f = self.bottleneck(f)            # demo1 no-op; phase2 compresses here
+        self.neck_feature = f             # split-point feature (distillation target)
+        f, self.bottleneck_info = self.bottleneck(f)   # identity: (f, None); phase2: (f_hat, info)
         d = self.decoder(f)
         return {t: self.heads[t](d) for t in (tasks or self.heads.keys()) if t in self.heads}
 

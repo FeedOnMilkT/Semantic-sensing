@@ -1,28 +1,45 @@
-"""Bottleneck factory (no registry).
+"""Bottleneck factory (no registry) — the neck->decoder slot.
 
-Demo 1 ships ONLY `identity` (a no-op placeholder), per CLAUDE.md constraint #4:
-the slot sits between neck and decoder so Phase 2 can drop a CompressAI
-EntropyBottleneck in here WITHOUT restructuring the framework. The contract is
-just feature-in -> feature-out (same shape); a future compressing bottleneck may
-additionally return a rate term, which the trainer can pick up then.
+Uniform contract:  forward(f) -> (f_hat, info)
+  - identity     : (f, None)                       no-op placeholder (seg / Phase 1).
+  - compression  : (f_hat, {"likelihoods", ...})   Phase-2 communication bottleneck
+                   (learned analysis/synthesis transforms + CompressAI EntropyBottleneck;
+                   emits a real bitstream via compress/decompress and a learned rate term).
+
+Adding a bottleneck = one builder fn + one dict entry (grep-able, no magic). The
+`compression` builder pulls in CompressAI, so it is imported LAZILY inside the builder
+— plain seg training (identity) never touches CompressAI.
 """
 import torch.nn as nn
 
 
 class Identity(nn.Module):
-    """No-op slot. Phase 2 replaces this with EntropyBottleneck (quantize +
-    learned entropy model + rate), keeping the same forward(f) -> f signature."""
+    """No-op slot: returns the feature unchanged + None info, matching the tuple
+    contract so MultiTaskNet / trainers handle every bottleneck uniformly. Phase 2
+    swaps this for `compression` (same forward(f) -> (f, info) signature)."""
     def __init__(self, **_):
         super().__init__()
 
     def forward(self, f):
-        return f
+        return f, None
+
+
+def _build_identity(cfg, in_channels):
+    return Identity(**cfg.get("args", {}))
+
+
+def _build_compression(cfg, in_channels):
+    from .compression import CommBottleneck   # lazy: imports CompressAI only on demand
+    if in_channels is None:
+        raise ValueError("compression bottleneck needs in_channels (neck.out_channels)")
+    return CommBottleneck(in_channels=in_channels, **cfg.get("args", {}))
 
 
 _BOTTLENECKS = {
-    "identity": Identity,
+    "identity": _build_identity,
+    "compression": _build_compression,
 }
 
 
-def build_bottleneck(cfg):
-    return _BOTTLENECKS[cfg.name](**cfg.get("args", {}))
+def build_bottleneck(cfg, in_channels=None):
+    return _BOTTLENECKS[cfg.name](cfg, in_channels)
