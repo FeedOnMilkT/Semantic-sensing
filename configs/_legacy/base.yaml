@@ -1,0 +1,42 @@
+# Shared blueprint defaults. Leaf configs (_base_: base.yaml) set the dataset,
+# heads, and task-specific knobs. Swap the backbone with one line: model.backbone.name.
+
+num_classes: 19          # referenced via ${num_classes} below
+max_depth: 80.0
+ignore_index: 255
+
+model:
+  backbone:
+    name: mit_b0         # <- one-line swap: mit_b0 | rtformer | topformer
+    args: {}
+  neck:
+    name: mlp_fusion     # mlp_fusion | fpn_lite
+    args: {out_channels: 128}
+  bottleneck:
+    name: identity       # demo1: no-op slot (Phase 2 -> EntropyBottleneck)
+    args: {}
+  decoder:
+    name: conv_decoder
+    args: {out_channels: 128, num_layers: 3, transformer_enhance: false}
+  heads: {}              # set by leaf config
+
+train:
+  epochs: 200
+  batch_size: 8
+  amp: true
+  scheduler: poly        # poly | cosine | none
+  warmup: 1000
+  grad_clip: 1.0
+  log_every: 50
+  optimizer: {name: adamw, lr: 6.0e-4, weight_decay: 0.01}
+
+loss:
+  weighting: {name: uncertainty}   # fixed | uncertainty | dwa
+  task_losses: {}
+
+eval:
+  meters: {}
+
+data:
+  train: {}
+  val: {}

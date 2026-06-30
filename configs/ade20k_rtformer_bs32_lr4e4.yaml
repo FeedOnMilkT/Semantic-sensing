@@ -1,0 +1,23 @@
+# RTFormer ADE20K teacher — A/B vs the faithful baseline (ade20k_rtformer.yaml,
+# effective batch 16 / lr 1e-4 / 160k iters -> mIoU 37.65 sq, 37.90 slide).
+#
+# Baseline's ~4pt gap to paper Base (42.1) was shown to be a TRAINING gap, not an
+# eval-protocol gap (slide eval only +0.25). This run pushes the learning lever:
+#   - effective batch 16 -> 32 (per-GPU 4 -> 8, 4 cards). ~16GB/80GB, lots of room.
+#   - lr 1e-4 -> 4e-4. 2x is linear-scaling for the 2x batch; the extra 2x is a
+#     deliberate aggressive bump to address suspected undertraining (cf the
+#     SegFormer precedent: paper LR underperformed, higher LR fixed it).
+#   - SAME 127 epochs (identical data budget) -> ~80k iters @ batch 32, so it's a
+#     fair comparison AND faster (~5-6h, GPU better utilized) than the 160k baseline.
+#
+# Launch: CUDA_VISIBLE_DEVICES=1,3,4,5 torchrun --nproc_per_node=4 tools/train.py \
+#         configs/ade20k_rtformer_bs32_lr4e4.yaml --out /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_bs32_lr4e4.pth
+_base_: ade20k_rtformer.yaml
+
+train:
+  epochs: 127           # same data budget as baseline; effective batch 32 -> ~80k iters
+  batch_size: 8         # PER-GPU; 4 cards -> effective 32
+  optimizer:
+    name: adamw
+    lr: 4.0e-4
+    weight_decay: 0.05

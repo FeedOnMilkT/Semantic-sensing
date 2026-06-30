@@ -1,0 +1,22 @@
+# RTFormer multi-task — SAME paper-faithful recipe as cityscapes_mt_rtformer.yaml
+# (484 epochs, crop 512x1024, lr 4e-4, wd 0.0125, uncertainty weighting), but the
+# backbone is initialized from our ImageNet-1K pretrain (val top1 71.8%,
+# /data/sidney/checkpoints/pretrained/rtformer_in1k.pth) instead of from scratch.
+#
+# Purpose: controlled A/B vs the `faithful` scratch run to isolate the effect of
+# ImageNet pretraining — especially on depth, which was the weak task for the
+# scratch RTFormer (RMSE 7.77 / delta1 0.749 vs MiT-B0-pretrained ~5.7-6.4).
+#
+# DDP: torchrun --nproc_per_node=4; batch_size is PER-GPU. per-GPU 4 -> effective
+# 16, matching the 2-card faithful run's effective batch, so #iters (~90K) and lr
+# (4e-4) are unchanged -> the ONLY changed variable is the backbone init.
+_base_: cityscapes_mt_rtformer.yaml
+
+model:
+  backbone:
+    name: rtformer
+    args:
+      pretrained: /data/sidney/checkpoints/pretrained/rtformer_in1k.pth
+
+train:
+  batch_size: 4        # PER-GPU; 4 cards -> effective 16 (== faithful); lr stays 4e-4

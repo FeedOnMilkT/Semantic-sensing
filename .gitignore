@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 模型/产物（一律放 /data/sidney/checkpoints/semantic-sensing/，不进 repo）
+*.pth
+*.bin
+*.onnx
+*.har
+
+# 运行产物
+logs/
+*.log
+runs/
+wandb/
+
+# 环境
+.venv/
+.ipynb_checkpoints/

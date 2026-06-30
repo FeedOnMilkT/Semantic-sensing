@@ -1,0 +1,39 @@
+# RTFormer multi-task baseline — PAPER-FAITHFUL (Wang et al., NeurIPS 2022).
+# Trunk before the heads matches the paper: stem + stage1-5 + DAPPM-fused stride-8
+# feature; no FPN neck, no multi-layer decoder. The shared trunk ends at s8; the
+# only multi-task deviation is forking the paper's 3x3+1x1 head into seg & depth.
+# Role: the real deliverable / Phase-2 teacher. Trained from scratch.
+_base_: cityscapes_mt_base.yaml
+
+model:
+  backbone:
+    name: rtformer
+    args: {}              # RTFormer-Base: channels (64,128,256,512), mem=128, groups=8, cross_size=12
+  neck:
+    name: passthrough     # forward backbone's DAPPM-fused s8 (stride-8); no FPN fusion
+    args:
+      key: s8
+  decoder:
+    name: identity        # the 3x3 lives in the head (paper); bottleneck stays the Phase-2 slot
+    args: {}
+  heads:
+    seg:
+      args:
+        upsample: 8       # s8 -> full res
+        mid: true         # RTFormer head: 3x3 conv + 1x1 classifier
+    depth:
+      args:
+        upsample: 8
+
+# Paper recipe (RTFormer §4.1 Cityscapes): from-scratch needs the long schedule.
+train:
+  epochs: 484             # paper: 484 epochs (~120K iters); was 200 (too short for from-scratch)
+  optimizer:
+    name: adamw
+    lr: 4.0e-4            # paper RTFormer lr (was 1.2e-3); wd 0.0125
+    weight_decay: 0.0125
+
+data:
+  train:
+    args:
+      crop_size: [512, 1024]   # paper crop (random-scale crop, NOT downsample); full-res eval unchanged

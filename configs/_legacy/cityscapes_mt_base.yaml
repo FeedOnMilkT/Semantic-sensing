@@ -1,0 +1,85 @@
+# Shared Phase-1b multi-task recipe (seg + depth on Cityscapes), FULL RESOLUTION
+# + standard augmentation. Leaf configs only swap the backbone, so SegFormer vs
+# RTFormer is a controlled comparison (identical recipe, one line differs).
+#
+# DDP: launch with torchrun --nproc_per_node=2; batch_size below is PER-GPU.
+# With 2 cards -> effective batch 16, so LR is linearly scaled from the old
+# single-card 6e-4 (batch 8) to 1.2e-3.
+#
+# NOTE: ${...} interpolations must be in block style (not YAML flow {}), since
+# the braces in ${name} collide with flow-mapping delimiters.
+_base_: base.yaml
+
+num_classes: 19
+
+model:
+  heads:
+    seg:
+      name: seg
+      args:
+        num_classes: ${num_classes}
+        upsample: 4
+    depth:
+      name: depth
+      args:
+        max_depth: ${max_depth}
+        upsample: 4
+
+train:
+  epochs: 200
+  batch_size: 8            # PER-GPU (x2 cards = effective 16)
+  amp: true
+  scheduler: poly
+  warmup: 1500
+  grad_clip: 1.0
+  log_every: 50
+  optimizer:
+    name: adamw
+    lr: 1.2e-3             # linearly scaled from 6e-4 @ batch8 (now effective 16)
+    weight_decay: 0.01
+
+loss:
+  weighting:
+    name: uncertainty      # auto-balance seg vs depth (Kendall 2018)
+  task_losses:
+    seg:
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+    depth:
+      min_depth: 1.0e-3
+      max_depth: ${max_depth}
+      w_grad: 0.1
+
+eval:
+  batch_size: 4            # full-res eval; keep <8 so MiT-B0 attention stays < int32 index limit
+  meters:
+    seg:
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+    depth:
+      min_depth: 1.0e-3
+      max_depth: ${max_depth}
+
+data:
+  train:
+    name: cityscapes
+    args:
+      root: /data/sidney/datasets/cityscapes
+      split: train
+      tasks: [seg, depth]
+      size: [1024, 2048]           # native resolution (scale jitter is relative to this)
+      crop_size: [1024, 1024]      # standard Cityscapes/SegFormer training crop (native pixel density)
+      augment: true                # random scale(0.5-2.0)+pad+crop+hflip
+      scale_range: [0.5, 2.0]
+      num_classes: ${num_classes}
+      max_depth: ${max_depth}
+  val:
+    name: cityscapes
+    args:
+      root: /data/sidney/datasets/cityscapes
+      split: val
+      tasks: [seg, depth]
+      size: [1024, 2048]           # full-resolution eval (fixes half-res mIoU)
+      augment: false
+      num_classes: ${num_classes}
+      max_depth: ${max_depth}

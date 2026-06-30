@@ -1,0 +1,83 @@
+# RTFormer seg teacher on ADE20K (SceneParse150), faithful to the RTFormer paper
+# (Sec 4.1 Implementation Details, ADE20K paragraph):
+#   batch 16, 160k iters, AdamW lr 1e-4 / weight_decay 0.05, poly power 0.9,
+#   aug = random scale [0.5,2.0] -> random crop -> random h-flip (no OHEM, no color
+#   jitter), ImageNet-pretrained backbone. Crop 512x512 = ADE20K community standard
+#   (the paper only says "settings identical to Cityscapes"; it doesn't pin a crop).
+#
+# 160k iters @ effective batch 16: 20210/16 ~= 1264 step/epoch -> ~127 epochs.
+# Effective batch is fixed at 16, so the epoch count is card-count independent.
+# For the EXACT 160k, pass `--max_steps 160000` (it overrides epochs in the loop).
+#
+# DDP (recommended): torchrun --nproc_per_node=4 ... ; batch_size is PER-GPU,
+# 4 cards x 4 = effective 16. Avoid GPU2 (faulty ECC). Single-GPU also works at
+# batch_size 16 if a card is free.
+_base_: base.yaml
+
+num_classes: 150          # ADE20K 150 classes (ignore_index 255 inherited from base)
+
+model:
+  backbone:
+    name: rtformer
+    # ImageNet-1K pretrain (val top1 71.8%). ADE20K is hard (150 classes, long tail);
+    # from-scratch under-trains badly. Drop this arg only for a scratch A/B.
+    args:
+      pretrained: /data/sidney/checkpoints/semantic-sensing/pretrained/rtformer_in1k.pth
+  heads:
+    seg:
+      name: seg
+      args:
+        num_classes: ${num_classes}
+        upsample: 4
+
+train:
+  epochs: 127             # ~= 160k iters @ effective batch 16; or override with --max_steps 160000
+  batch_size: 4           # PER-GPU; torchrun --nproc_per_node=4 -> effective 16 (paper)
+  amp: true
+  scheduler: poly         # poly_lr uses power=0.9 by default -> matches paper
+  warmup: 1500
+  grad_clip: 1.0
+  log_every: 50
+  sync_bn: true           # paper uses syncBN; only takes effect under DDP
+  optimizer:
+    name: adamw
+    lr: 1.0e-4
+    weight_decay: 0.05
+
+loss:
+  weighting:
+    name: fixed
+    weights:
+      seg: 1.0
+  task_losses:
+    seg:
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+
+eval:
+  batch_size: 1           # val images vary in size; resized per-sample to `size` then batched
+  meters:
+    seg:
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+
+data:
+  train:
+    name: ade20k
+    args:
+      split: train
+      tasks: [seg]
+      augment: true
+      crop_size: [512, 512]
+      scale_range: [0.5, 2.0]
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+  val:
+    name: ade20k
+    args:
+      split: val
+      tasks: [seg]
+      augment: false
+      size: [512, 512]
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}

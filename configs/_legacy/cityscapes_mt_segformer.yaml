@@ -1,0 +1,9 @@
+# SegFormer (MiT-B0, ImageNet-pretrained) multi-task baseline.
+# Role: reference ceiling / debugging oracle — NOT the deployment model.
+_base_: cityscapes_mt_base.yaml
+
+model:
+  backbone:
+    name: mit_b0
+    args:
+      pretrained: /data/sidney/checkpoints/pretrained/mit_b0_imagenet_hf.bin

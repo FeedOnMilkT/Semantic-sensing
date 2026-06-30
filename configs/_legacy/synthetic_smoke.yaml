@@ -1,0 +1,72 @@
+# Tiny synthetic config so the CLI tools run with no dataset on disk:
+#   python tools/train.py configs/synthetic_smoke.yaml --max-steps 5
+#   python tools/eval.py  configs/synthetic_smoke.yaml --ckpt checkpoints/model.pth
+#   python tools/export_onnx.py configs/synthetic_smoke.yaml --shape 1 3 64 128 --out /tmp/m.onnx
+_base_: base.yaml
+
+num_classes: 19
+
+model:
+  backbone:
+    name: mit_b0
+    args: {}
+  heads:
+    seg:
+      name: seg
+      args:
+        num_classes: ${num_classes}
+        upsample: 4
+    depth:
+      name: depth
+      args:
+        max_depth: ${max_depth}
+        upsample: 4
+
+train:
+  epochs: 1
+  batch_size: 2
+  amp: false
+  warmup: 0
+  optimizer:
+    name: adamw
+    lr: 6.0e-4
+    weight_decay: 0.01
+
+loss:
+  weighting:
+    name: uncertainty
+  task_losses:
+    seg:
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+    depth:
+      min_depth: 1.0e-3
+      max_depth: ${max_depth}
+      w_grad: 0.1
+
+eval:
+  meters:
+    seg:
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+    depth:
+      min_depth: 1.0e-3
+      max_depth: ${max_depth}
+
+data:
+  train:
+    name: synthetic
+    args:
+      tasks: [seg, depth]
+      size: [64, 128]
+      num_classes: ${num_classes}
+      length: 8
+      max_depth: ${max_depth}
+  val:
+    name: synthetic
+    args:
+      tasks: [seg, depth]
+      size: [64, 128]
+      num_classes: ${num_classes}
+      length: 8
+      max_depth: ${max_depth}

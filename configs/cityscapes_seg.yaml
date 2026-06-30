@@ -1,0 +1,63 @@
+# Phase 1a: single-task segmentation on Cityscapes. Target mIoU >= 68.
+_base_: base.yaml
+
+num_classes: 19
+
+model:
+  backbone:
+    name: mit_b0
+    # ImageNet-1k pretrained MiT-B0 (from HF nvidia/mit-b0, key-remapped). Needed
+    # to reach mIoU>=68 from a short schedule. Swapping to rtformer/topformer? drop
+    # this arg (they don't take it): --set model.backbone.name=rtformer model.backbone.args='{}'
+    args:
+      pretrained: /data/sidney/checkpoints/semantic-sensing/pretrained/mit_b0_imagenet_hf.bin
+  heads:
+    seg:
+      name: seg
+      args:
+        num_classes: ${num_classes}
+        upsample: 4
+
+train:
+  epochs: 200
+  batch_size: 8
+  optimizer:
+    name: adamw
+    lr: 6.0e-4
+    weight_decay: 0.01
+
+loss:
+  weighting:
+    name: fixed
+    weights:
+      seg: 1.0
+  task_losses:
+    seg:
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+
+eval:
+  meters:
+    seg:
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+
+data:
+  train:
+    name: cityscapes
+    args:
+      root: /data/sidney/datasets/cityscapes
+      split: train
+      tasks: [seg]
+      size: [512, 1024]
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+  val:
+    name: cityscapes
+    args:
+      root: /data/sidney/datasets/cityscapes
+      split: val
+      tasks: [seg]
+      size: [512, 1024]
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}

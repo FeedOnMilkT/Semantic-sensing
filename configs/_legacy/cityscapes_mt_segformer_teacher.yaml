@@ -1,0 +1,15 @@
+# SegFormer (MiT-B0) multi-task TEACHER — the Phase-2 distillation teacher.
+# Extends the proven cs_mt_segformer recipe (which hit seg 74.5 / depth RMSE 5.70
+# at 200ep) to a paper-length schedule. SegFormer Cityscapes = 160K iters @ batch 8
+# (~430 epochs of image presentations); we use 484ep to match that image budget AND
+# align with the RTFormer faithful run for cross-comparison. Everything else is the
+# proven segformer recipe unchanged (crop 1024x1024, mlp_fusion + conv_decoder,
+# uncertainty weighting, lr 1.2e-3 @ effective batch 16).
+#
+# 4 cards x per-GPU 4 = effective 16 (== the original 2x8 run -> lr unchanged).
+_base_: cityscapes_mt_segformer.yaml
+
+train:
+  epochs: 484
+  batch_size: 4        # PER-GPU; 4 cards -> effective 16 (lr 1.2e-3 stays)
+  # save_every_epochs defaults to 1 -> .last.pth rolls every epoch (resume-safe)

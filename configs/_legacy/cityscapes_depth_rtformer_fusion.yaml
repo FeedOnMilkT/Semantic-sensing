@@ -1,0 +1,96 @@
+# RTFormer single-task DEPTH + multi-scale fusion neck — A/B vs the passthrough
+# baseline (cs_depth_rtformer_pretrained.yaml, RMSE 8.39 / d1 0.717). Derived from
+# it by changing ONLY the neck path: passthrough(s8, 1/8) -> mlp_fusion(s4..s32
+# fused to 1/4), and the depth head upsample 8->4 (forced by the head now reading
+# 1/4 instead of 1/8). Everything else byte-identical (pretrained backbone, 484ep,
+# lr 4e-4, crop 512x1024, eff-batch 16).
+#
+# Hypothesis: depth's weakness is the single coarse stride-8 head feature; feeding
+# it fused 1/4-res multi-scale features (incl. fine s4) should sharpen depth
+# boundaries -> better d1/RMSE, toward MiT-B0's 0.889. Cost: ~4x neck/head pixels.
+num_classes: 19
+max_depth: 80.0
+ignore_index: 255
+model:
+  backbone:
+    name: rtformer
+    args:
+      pretrained: /data/sidney/checkpoints/pretrained/rtformer_in1k.pth
+  neck:
+    name: mlp_fusion
+    args:
+      out_channels: 128
+  bottleneck:
+    name: identity
+    args: {}
+  decoder:
+    name: identity
+    args:
+      out_channels: 128
+      num_layers: 3
+      transformer_enhance: false
+  heads:
+    depth:
+      name: depth
+      args:
+        max_depth: ${max_depth}
+        upsample: 4
+train:
+  epochs: 484
+  batch_size: 4
+  amp: true
+  scheduler: poly
+  warmup: 1500
+  grad_clip: 1.0
+  log_every: 50
+  optimizer:
+    name: adamw
+    lr: 0.0004
+    weight_decay: 0.0125
+loss:
+  weighting:
+    name: uncertainty
+  task_losses:
+    depth:
+      min_depth: 0.001
+      max_depth: ${max_depth}
+      w_grad: 0.1
+eval:
+  meters:
+    depth:
+      min_depth: 0.001
+      max_depth: ${max_depth}
+  batch_size: 4
+data:
+  train:
+    name: cityscapes
+    args:
+      root: /data/sidney/datasets/cityscapes
+      split: train
+      tasks:
+      - depth
+      size:
+      - 1024
+      - 2048
+      crop_size:
+      - 512
+      - 1024
+      augment: true
+      scale_range:
+      - 0.5
+      - 2.0
+      num_classes: ${num_classes}
+      max_depth: ${max_depth}
+  val:
+    name: cityscapes
+    args:
+      root: /data/sidney/datasets/cityscapes
+      split: val
+      tasks:
+      - depth
+      size:
+      - 1024
+      - 2048
+      augment: false
+      num_classes: ${num_classes}
+      max_depth: ${max_depth}

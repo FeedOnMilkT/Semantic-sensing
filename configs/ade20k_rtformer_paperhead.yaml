@@ -1,0 +1,35 @@
+# RTFormer ADE20K — A/B isolating the SEGMENTATION HEAD.
+#
+# The faithful baseline (ade20k_rtformer.yaml -> 37.65 sq / 37.90 slide) used the
+# blueprint's GENERIC head: mlp_fusion neck (re-fuses all 4 scales) + 3-layer
+# conv_decoder, operating at stride-4. That is NOT the paper's head.
+#
+# The RTFormer-paper head is already built into the backbone: forward() fuses
+# DAPPM(s32) into the stride-8 feature. The paper-faithful wiring (same as
+# cityscapes_mt_rtformer.yaml) just forwards that s8 straight to a 3x3+1x1 head:
+#   neck: passthrough(s8)  ->  decoder: identity  ->  seg head: mid(3x3)+1x1, up 8
+#
+# This run keeps EVERYTHING else identical to the faithful baseline (lr 1e-4, wd
+# 0.05, 127 ep ~= 160k iters @ eff batch 16, ImageNet pretrain, same aug). So the
+# ONLY changed variable vs 37.65/37.90 is the head -> measures how much of the
+# ~4pt gap to paper 42.1 is the generic-vs-paper head.
+#
+# Launch: CUDA_VISIBLE_DEVICES=1,3,4,5 torchrun --nproc_per_node=4 tools/train.py \
+#   configs/ade20k_rtformer_paperhead.yaml --out /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth
+_base_: ade20k_rtformer.yaml
+
+model:
+  neck:
+    name: passthrough       # forward backbone's DAPPM-fused s8 (stride-8); no FPN re-fusion
+    args:
+      key: s8
+  decoder:
+    name: identity          # the 3x3 lives in the head (paper); no extra decoder
+    args: {}
+  heads:
+    seg:
+      name: seg
+      args:
+        num_classes: ${num_classes}
+        upsample: 8          # s8 -> full res
+        mid: true            # RTFormer head: 3x3 conv + BN + ReLU before 1x1 classifier

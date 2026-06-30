@@ -1,0 +1,23 @@
+# SegFormer (MiT-B0) multi-task TEACHER — PAPER-FAITHFUL fine-tuning recipe.
+# Fixes the seg overfitting of the first teacher attempt (484ep @ lr 1.2e-3 ->
+# seg 74.5->73.3) by adopting SegFormer's actual Cityscapes recipe: the key is the
+# 20x-lower LR that the paper uses precisely for gentle fine-tuning of the
+# ImageNet-pretrained transformer.
+#
+# SegFormer Cityscapes (Xie et al. 2021): 160K iters, batch 8, crop 1024x1024,
+# AdamW lr 6e-5, poly, warmup 1500, wd 0.01.
+#   -> eff batch 8 (4 cards x per-GPU 2 + SyncBN so BN sees 8, like the paper's
+#      8x1 + SyncBN); 160K iters / (2975/8=372 it/ep) ~= 430 epochs.
+# Deviations (inherent / kept): multi-task (seg+depth, uncertainty weighting) vs
+# paper seg-only; seg loss CE+Dice+Lovasz vs paper CE. Backbone = our ImageNet
+# pretrain (mit_b0_imagenet_hf.bin).
+_base_: cityscapes_mt_segformer.yaml
+
+train:
+  epochs: 430              # ~= 160K iters at eff-batch 8
+  batch_size: 2            # PER-GPU; 4 cards -> effective 8 (paper batch)
+  sync_bn: true            # per-GPU 2 -> SyncBN aggregates BN over the full 8
+  optimizer:
+    name: adamw
+    lr: 6.0e-5             # paper Cityscapes fine-tuning LR (was 1.2e-3 -> seg overfit)
+    weight_decay: 0.01

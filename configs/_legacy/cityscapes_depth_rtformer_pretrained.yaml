@@ -1,0 +1,98 @@
+# DEPTH-ONLY control baseline — derived programmatically from
+# cityscapes_mt_rtformer_pretrained.yaml by deleting ONLY the seg task
+# (head / loss / meter / dataset task). Everything else is byte-identical:
+# same pretrained RTFormer backbone, same neck/decoder/depth-head, same recipe
+# (484ep, crop 512x1024, lr 4e-4, wd 0.0125, poly, uncertainty weighting),
+# same effective batch 16 (per-GPU 4 x 4 cards).
+#
+# Purpose: measure depth's CEILING without seg competition. If depth here is
+# much better than the multitask run (RMSE 7.98 / d1 0.696), the bottleneck is
+# multi-task capacity competition; if it's ~the same, it's an architecture/data
+# ceiling. Controlled A/B — the ONLY changed variable is "seg present or not".
+num_classes: 19
+max_depth: 80.0
+ignore_index: 255
+model:
+  backbone:
+    name: rtformer
+    args:
+      pretrained: /data/sidney/checkpoints/pretrained/rtformer_in1k.pth
+  neck:
+    name: passthrough
+    args:
+      out_channels: 128
+      key: s8
+  bottleneck:
+    name: identity
+    args: {}
+  decoder:
+    name: identity
+    args:
+      out_channels: 128
+      num_layers: 3
+      transformer_enhance: false
+  heads:
+    depth:
+      name: depth
+      args:
+        max_depth: ${max_depth}
+        upsample: 8
+train:
+  epochs: 484
+  batch_size: 4
+  amp: true
+  scheduler: poly
+  warmup: 1500
+  grad_clip: 1.0
+  log_every: 50
+  optimizer:
+    name: adamw
+    lr: 0.0004
+    weight_decay: 0.0125
+loss:
+  weighting:
+    name: uncertainty
+  task_losses:
+    depth:
+      min_depth: 0.001
+      max_depth: ${max_depth}
+      w_grad: 0.1
+eval:
+  meters:
+    depth:
+      min_depth: 0.001
+      max_depth: ${max_depth}
+  batch_size: 4
+data:
+  train:
+    name: cityscapes
+    args:
+      root: /data/sidney/datasets/cityscapes
+      split: train
+      tasks:
+      - depth
+      size:
+      - 1024
+      - 2048
+      crop_size:
+      - 512
+      - 1024
+      augment: true
+      scale_range:
+      - 0.5
+      - 2.0
+      num_classes: ${num_classes}
+      max_depth: ${max_depth}
+  val:
+    name: cityscapes
+    args:
+      root: /data/sidney/datasets/cityscapes
+      split: val
+      tasks:
+      - depth
+      size:
+      - 1024
+      - 2048
+      augment: false
+      num_classes: ${num_classes}
+      max_depth: ${max_depth}
