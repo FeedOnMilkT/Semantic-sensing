@@ -90,8 +90,14 @@ f --g_a(analysis)--> y --EntropyBottleneck(量化+学习rate)--> y_hat --g_s(syn
   （L=feature_mse+β·bpp，codec/aux 双优化器，poly LR）+ `evaluate_student`（一遍出 bpp-mIoU 点）；
   CLI `tools/train_student.py`（`--smoke` 合成验证 / `--teacher-ckpt` 载真 teacher / `--beta` 扫描）。
   合成数据已验证两版都能训 + 出 `[POINT] bpp/mIoU`。seg 路径仍零 compressai 依赖。
-- **② 载真 teacher（next）**：`--teacher-ckpt /data/.../ade20k_rtformer_bs32_lr4e4.pth` 冻结，
-  在真 ADE20K 上单 β 短训出第一个**真** bpp-mIoU 点（先 sanity，再 β 扫描）。跑前 `nvidia-smi`。
+- ✅ **② 载真 teacher + 首个真实点（done, 2026-06-30）**：
+  - Pre-flight：HF 缓存在；teacher 载入 missing=0 unexpected=0；冻结 teacher 在 128 val 子集
+    mIoU **0.334** / pixel_acc 0.775（全集 38.2，子集欠采样所以偏低，pixel_acc 对得上）。
+  - 首个真实点：late、**β=0.001**、1 epoch(~2526 步)、val-limit 128 →
+    **bpp=1.467, mIoU=0.306, pixel_acc=0.757**。即低 β 下 student 几乎追回 teacher（0.306 vs 0.334，
+    **−0.028 / ~9% 相对，仅训 1 epoch**）。**整条真实管道端到端验证通过。**
+    ckpt: `students/late_b0.001_sanity.pth`。
+  - 注：`--epochs` 默认 1，所以 `--max-steps 10000` 被 1 epoch（2526 步）截断；要更多步设 `--epochs`。
 - **③ early 的 s4 旁路码率计入**：使 early/late 公平可比（只影响 early；late 本来就全额计 bit）。
   画最终对比图前做。
 - 各跑 β 扫描 → 两条 bpp-mIoU 曲线 + 部署对比表（送端是否含注意力）。
