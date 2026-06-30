@@ -66,6 +66,8 @@ class StudentTrainer:
 
                 out = self.student(x)
                 distortion = feature_mse(out["target"].detach(), out["recon"])
+                if "recon_aux" in out:                       # early + compress_s4: distill s4 too
+                    distortion = distortion + feature_mse(out["target_aux"].detach(), out["recon_aux"])
                 bpp = bpp_from_info(out["info"], num_pixels)
                 loss = distortion + self.beta * bpp
                 if self.task_weight and "seg" in batch.get("targets", {}):

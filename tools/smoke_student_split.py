@@ -29,7 +29,7 @@ from src.models import build_model
 from src.models.backbones.rtformer import RTFormer
 from src.models.bottlenecks import build_bottleneck
 from src.models.student import SplitStudent, build_student, split_in_channels
-from src.losses.compression import rate_distortion_loss, bpp_from_info
+from src.losses.compression import rate_distortion_loss, bpp_from_info, feature_mse
 
 SIZE = (64, 128)
 # Run on CPU: the rANS range coder (compress/decompress) is CPU-only, and mixing the
@@ -109,6 +109,8 @@ def make_split_checks(split, cfg):
             out = student(x)
             total, parts = rate_distortion_loss(out["recon"], out["target"].detach(),
                                                 out["info"], beta=0.01, num_pixels=num_pixels)
+            if "recon_aux" in out:                       # early + compress_s4: distill s4 too
+                total = total + feature_mse(out["target_aux"].detach(), out["recon_aux"])
             opt.zero_grad(); total.backward(); opt.step()
             aux = student.aux_loss()
             aux_opt.zero_grad(); aux.backward(); aux_opt.step()
@@ -120,26 +122,28 @@ def make_split_checks(split, cfg):
         assert dists[-1] < dists[0] * 0.9, f"[{split}] distortion did not drop: {dists[0]:.4f}->{dists[-1]:.4f}"
 
     def c3_bitstream_roundtrip():
+        # test the bottleneck class roundtrip directly (the exactness guarantee lives here;
+        # the s4 bottleneck is the same class -> covered). Decoupled from student.compress payload.
         s = student.cpu().eval()
         s.update(force=True)
+        bn = s.bottleneck
         B = 2
         num_pixels = B * SIZE[0] * SIZE[1]
         torch.manual_seed(1)
-        x = torch.randn(B, 3, *SIZE)
+        feat = torch.randn(B, bn.in_channels, 16, 32)
         with torch.no_grad():
-            out = s(x)
-            recon_fwd = out["recon"]
-            est_bpp = bpp_from_info(out["info"], num_pixels).item()
-            payload, ctx = s.compress(x)
+            recon_fwd, info = bn(feat)
+            est_bpp = bpp_from_info(info, num_pixels).item()
+            payload = bn.compress(feat)
             with tempfile.TemporaryDirectory() as d:
                 total_bytes = 0
-                for name, strs in (("y", payload["strings"][0]), ("z", payload["strings"][1])):
-                    for i, sbytes in enumerate(strs):
-                        p = os.path.join(d, f"{name}_{i}.bin")
+                for gi, group in enumerate(payload["strings"]):      # hyperprior: [y_strings, z_strings]
+                    for i, sbytes in enumerate(group):
+                        p = os.path.join(d, f"{gi}_{i}.bin")
                         with open(p, "wb") as fh:
                             fh.write(sbytes)
                         total_bytes += os.path.getsize(p)
-            recon_dec = s.bottleneck.decompress(payload)
+            recon_dec = bn.decompress(payload)
         actual_bpp = total_bytes * 8 / num_pixels
         max_diff = (recon_fwd - recon_dec).abs().max().item()
         rel = abs(est_bpp - actual_bpp) / actual_bpp

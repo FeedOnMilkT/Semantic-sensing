@@ -9,6 +9,8 @@ _base_: ade20k_rtformer.yaml
 
 student:
   split: early
+  compress_s4: true          # ③: also compress the s4 bypass so its bits count -> fair bpp vs late
+                             # (set false to revert to the understated free-s4 bypass)
 
 bottleneck:
   name: hyperprior            # full mean-scale hyperprior (optimal-deployable)
