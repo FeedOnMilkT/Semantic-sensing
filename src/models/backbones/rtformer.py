@@ -202,21 +202,43 @@ class RTFormer(nn.Module):
     def _up(self, y, ref):
         return F.interpolate(y, size=ref.shape[-2:], mode="bilinear", align_corners=False)
 
-    def _features(self, x):
-        """Trunk (stem -> stage5), shared by forward() and forward_trunk().
-        Returns (s4, high_pre_dappm, s16, s32)."""
-        s4 = self.stage1(self.stem(x))                # 1/4, 64
-        high = self.stage2(s4)                        # 1/8, 128
-        # stage3: dual basic + bilateral fusion
+    def forward_sender(self, x):
+        """Send-side of the EARLY split: pure-conv stem + stage1 + stage2 (no
+        attention, Hailo-foldable). Returns (s4, high):
+          s4   (1/4, c1) -- high-res scale the head later needs (it is produced
+                 before stage2, so it must reach the receiver -> 'high-res bypass').
+          high (1/8, c2) -- the stage2 feature = the early split point, just BEFORE
+                 the dual-resolution fork. This is the tensor to compress."""
+        s4 = self.stage1(self.stem(x))                # 1/4, c1
+        high = self.stage2(s4)                        # 1/8, c2  (early split feature)
+        return s4, high
+
+    def _receiver_trunk(self, s4, high):
+        """Receive-side trunk from the stage2 feature: stage3 (dual + bilateral
+        fusion) + stage4/5. Returns (s4, high_pre_dappm, s16, s32). The old in-line
+        trunk now lives here so forward()/forward_trunk()/forward_receiver() share it
+        verbatim (behaviour-identical)."""
         h3 = self.s3_high(high)
         l3 = self.s3_low(high)
         high = F.relu(h3 + self._up(self.s3_l2h(l3), h3), inplace=True)
         low = F.relu(l3 + self.s3_h2l(h3), inplace=True)
-        s16 = low                                     # 1/16, 256
-        # stage4/5: RTFormer blocks (stepped, low->high via CA)
-        high, low = self.stage4(high, low)            # low -> 1/32, 512
-        high, low = self.stage5(high, low)            # low stays 1/32, 512
+        s16 = low                                     # 1/16, c3
+        high, low = self.stage4(high, low)            # low -> 1/32, c4
+        high, low = self.stage5(high, low)            # low stays 1/32, c4
         return s4, high, s16, low
+
+    def _features(self, x):
+        """Trunk (stem -> stage5), shared by forward() and forward_trunk().
+        Composes forward_sender + _receiver_trunk. Returns (s4, high, s16, s32)."""
+        return self._receiver_trunk(*self.forward_sender(x))
+
+    def forward_receiver(self, s4, high):
+        """Receive-side of the EARLY split: run the rest of the backbone from the
+        (reconstructed) stage2 `high` feature + the bypassed `s4`. DAPPM context
+        fused into the stride-8 feature. Returns the {s4,s8,s16,s32} contract."""
+        s4, high, s16, s32 = self._receiver_trunk(s4, high)
+        high = F.relu(high + self._up(self.dappm(s32), high), inplace=True)
+        return {"s4": s4, "s8": high, "s16": s16, "s32": s32}
 
     def forward(self, x):
         s4, high, s16, s32 = self._features(x)

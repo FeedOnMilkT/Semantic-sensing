@@ -1,0 +1,20 @@
+# Early-split student (V1 / pure-conv sender).
+# Split at the backbone's stage2 feature (just BEFORE the dual-resolution fork). Sender
+# = stem + stage1 + stage2 (pure conv, Hailo-foldable; ALL attention deferred to the
+# receiver -- the SegFormer-impossible advantage). Receiver = stage3..5 + DAPPM + neck +
+# decoder + head. The high-res s4 scale bypasses the bottleneck ("高分旁路"); only the
+# semantic stage2 feature is compressed. Teacher = frozen RTFormer (same as the late
+# variant). Identical bottleneck/recipe -> only the split point changes.
+_base_: ade20k_rtformer.yaml
+
+student:
+  split: early
+
+bottleneck:
+  name: hyperprior            # full mean-scale hyperprior (optimal-deployable)
+  args:
+    latent_channels: 128
+    hyper_channels: 128
+    hidden: 128
+    num_down: 1
+    hyper_down: 1

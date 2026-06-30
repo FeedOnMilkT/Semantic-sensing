@@ -31,13 +31,21 @@ def _build_identity(cfg, in_channels):
 def _build_compression(cfg, in_channels):
     from .compression import CommBottleneck   # lazy: imports CompressAI only on demand
     if in_channels is None:
-        raise ValueError("compression bottleneck needs in_channels (neck.out_channels)")
+        raise ValueError("compression bottleneck needs in_channels (split feature channels)")
     return CommBottleneck(in_channels=in_channels, **cfg.get("args", {}))
 
 
+def _build_hyperprior(cfg, in_channels):
+    from .hyperprior import HyperpriorBottleneck   # lazy: imports CompressAI only on demand
+    if in_channels is None:
+        raise ValueError("hyperprior bottleneck needs in_channels (split feature channels)")
+    return HyperpriorBottleneck(in_channels=in_channels, **cfg.get("args", {}))
+
+
 _BOTTLENECKS = {
-    "identity": _build_identity,
-    "compression": _build_compression,
+    "identity": _build_identity,            # no-op (seg / Phase 1)
+    "compression": _build_compression,      # factorized EntropyBottleneck (de-risk baseline)
+    "hyperprior": _build_hyperprior,        # mean-scale hyperprior (full / optimal-deployable)
 }
 
 
