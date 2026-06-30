@@ -10,7 +10,7 @@ model:
   backbone:
     name: mit_b0
     args:
-      pretrained: /data/sidney/checkpoints/pretrained/mit_b0_imagenet_hf.bin
+      pretrained: /data/sidney/checkpoints/semantic-sensing/pretrained/mit_b0_imagenet_hf.bin
   heads:
     seg:
       name: seg
