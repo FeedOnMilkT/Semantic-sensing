@@ -86,7 +86,12 @@ f --g_a(analysis)--> y --EntropyBottleneck(量化+学习rate)--> y_hat --g_s(syn
    smoke 整体固定 CPU。
 
 ## 下一步（Phase 2 训练）
-- 把 rate 项 + aux 优化器接进 `Trainer`（目前只跑 task loss）。
-- 载入真 teacher `ade20k_rtformer_bs32_lr4e4`(38.2) 冻结（选项 A）；当前 smoke 用随机权重只验接线。
-- 解决 early 的 s4 旁路码率计入，使 early/late bpp 可公平比。
+- ✅ **① rate 接进训练（done）**：`src/engine/student_trainer.py` 的 `StudentTrainer`
+  （L=feature_mse+β·bpp，codec/aux 双优化器，poly LR）+ `evaluate_student`（一遍出 bpp-mIoU 点）；
+  CLI `tools/train_student.py`（`--smoke` 合成验证 / `--teacher-ckpt` 载真 teacher / `--beta` 扫描）。
+  合成数据已验证两版都能训 + 出 `[POINT] bpp/mIoU`。seg 路径仍零 compressai 依赖。
+- **② 载真 teacher（next）**：`--teacher-ckpt /data/.../ade20k_rtformer_bs32_lr4e4.pth` 冻结，
+  在真 ADE20K 上单 β 短训出第一个**真** bpp-mIoU 点（先 sanity，再 β 扫描）。跑前 `nvidia-smi`。
+- **③ early 的 s4 旁路码率计入**：使 early/late 公平可比（只影响 early；late 本来就全额计 bit）。
+  画最终对比图前做。
 - 各跑 β 扫描 → 两条 bpp-mIoU 曲线 + 部署对比表（送端是否含注意力）。
