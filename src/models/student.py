@@ -1,39 +1,53 @@
 """Split-inference student: a frozen teacher (MultiTaskNet) with a trainable
 communication bottleneck spliced in at a configurable split point.
 
-Two splits (config `student.split`), reusing the SAME teacher and bottleneck code —
-only the tap point and the receiver modules differ (a controlled split-point ablation):
+Four splits (config `student.split`), reusing the SAME teacher + bottleneck recipe —
+only the tap point and the receiver modules differ (a controlled split-point ablation,
+phase2 spec §3.1). EARLY is single-branch; MID/LATE are dual-branch (the conv->attention
+cut emits two feature streams), so they use the dual-latent / single-container bottleneck.
 
-  - "late"  : split at the neck output (semantic waist, single fused tensor).
-              sender = backbone + neck ; receiver = decoder + heads.
-  - "early" : split at the backbone's stage2 feature (pre dual-resolution fork; the
-              sender stem+stage1+stage2 is pure conv -> Hailo-foldable). receiver =
-              stage3..5 + DAPPM + neck + decoder + heads. The high-res s4 scale (needed
-              by the head but produced before stage2) ALSO crosses the channel:
-                * student.compress_s4: true  -> a SECOND bottleneck compresses s4 and its
-                  bits count toward the rate (fair bpp vs late; item ③).
-                * student.compress_s4: false -> s4 BYPASSES the bottleneck uncompressed
-                  (its bits are NOT counted -> early bpp is understated; flagged).
+  - "early": stage2 feature (pre dual-resolution fork; sender stem+stage1+stage2 is pure
+             conv -> Hailo-foldable). SINGLE latent. The high-res s4 scale also crosses:
+               * compress_s4: true  -> a SECOND bottleneck compresses s4, bits counted.
+               * compress_s4: false -> s4 bypasses uncompressed (bpp understated, flagged).
+  - "mid"  : ★ MAIN LINE. cut AFTER stage3 (conv->attention boundary). DUAL payload
+             (x_h 1/8 c2, x_l 1/16 c3) = spec (x3_, x3). NO s4 (paper passthrough(s8) tail).
+  - "late" : cut AFTER stage5 (attention on the SENDER -> NOT deployable, ablation only).
+             DUAL payload (x_h 1/8 c2, x_l 1/32 c4) = spec (x5_, x5).
+  - "neck" : legacy de-risk split at the neck output (single fused tensor); kept for the
+             older split smoke. Not a phase2 main/ablation arm.
 
 The teacher is FROZEN: it supplies the distillation target feature(s) at the split and
-the frozen tail that turns the reconstruction into task predictions. Only the
-bottleneck(s) train, isolating the split point as the variable.
+the frozen tail that turns the reconstruction into task predictions. Stage 1 trains only
+the bottleneck. Stage 2 (spec §5.2) freezes the bottleneck and fine-tunes the RECEIVER
+TAIL (the teacher modules downstream of the cut) with the task loss — see
+`set_stage2_trainable()` / `receiver_parameters()`.
 
 forward(x) -> {"preds","target","recon","info"[, "target_aux","recon_aux"]}:
-  preds  : task predictions via the frozen receiver on the reconstructed feature(s)
-  target/recon         : main split feature + its reconstruction
-  target_aux/recon_aux : (early + compress_s4) the s4 feature + its reconstruction
-  info   : rate info; info["likelihoods"] sums ALL transmitted tensors (main [+ s4])
+  target/recon : the split feature(s) + reconstruction(s). For mid/late these are
+                 (x_h, x_l) tuples; the trainer's feature_mse sums over branches.
+  info         : rate info; info["likelihoods"] sums ALL transmitted tensors.
 """
 import torch.nn as nn
 
 from .bottlenecks import build_bottleneck
 
+# backbone submodules on the SENDER side of each split (everything else + neck/decoder/
+# heads is the receiver tail that Stage 2 fine-tunes). Order matches rtformer.py forward.
+_ALL_BB = ("stem", "stage1", "stage2", "s3_high", "s3_low", "s3_l2h", "s3_h2l",
+           "stage4", "stage5", "dappm")
+_SENDER_BB = {
+    "early": ("stem", "stage1", "stage2"),
+    "mid":   ("stem", "stage1", "stage2", "s3_high", "s3_low", "s3_l2h", "s3_h2l"),
+    "late":  ("stem", "stage1", "stage2", "s3_high", "s3_low", "s3_l2h", "s3_h2l",
+              "stage4", "stage5"),
+}
+
 
 class SplitStudent(nn.Module):
     def __init__(self, teacher, bottleneck, split, s4_bottleneck=None):
         super().__init__()
-        assert split in ("early", "late"), f"unknown split '{split}'"
+        assert split in ("early", "mid", "late", "neck"), f"unknown split '{split}'"
         self.split = split
         self.teacher = teacher
         self.bottleneck = bottleneck
@@ -47,23 +61,33 @@ class SplitStudent(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        self.teacher.eval()                          # only the bottleneck(s) train
+        self.teacher.eval()                          # Stage 1: only the bottleneck trains
         return self
 
     # ---- split routing ----
     def _sender(self, x):
-        t = self.teacher
-        if self.split == "late":
-            return t.neck(t.backbone(x)), {}
-        s4, high = t.backbone.forward_sender(x)      # early: pure-conv sender
-        return high, {"s4": s4}
+        bb = self.teacher.backbone
+        if self.split == "neck":
+            return self.teacher.neck(bb(x)), {}
+        if self.split == "early":
+            s4, high = bb.forward_sender(x)          # pure-conv sender
+            return high, {"s4": s4}
+        if self.split == "mid":
+            return bb.forward_sender_mid(x), {}      # (x_h, x_l)
+        return bb.forward_sender_late(x), {}         # late: (x_h, x_l)
 
     def _receiver(self, feat, ctx):
         t = self.teacher
-        if self.split == "late":
+        if self.split == "neck":
             d = t.decoder(feat)
-        else:
+        elif self.split == "early":
             feats = t.backbone.forward_receiver(ctx["s4"], feat)
+            d = t.decoder(t.neck(feats))
+        elif self.split == "mid":
+            feats = t.backbone.forward_receiver_mid(*feat)   # feat = (x_h_hat, x_l_hat)
+            d = t.decoder(t.neck(feats))
+        else:  # late
+            feats = t.backbone.forward_receiver_late(*feat)
             d = t.decoder(t.neck(feats))
         return {k: t.heads[k](d) for k in t.heads}
 
@@ -83,7 +107,7 @@ class SplitStudent(nn.Module):
         out["preds"] = self._receiver(recon, ctx)
         return out
 
-    # ---- deployment path (real bitstream) ----
+    # ---- deployment path (real bitstream; mid/late = single dual-latent container) ----
     def compress(self, x):
         split_feat, ctx = self._sender(x)
         payload = {"main": self.bottleneck.compress(split_feat)}
@@ -98,7 +122,7 @@ class SplitStudent(nn.Module):
             ctx = {"s4": self.s4_bottleneck.decompress(payload["s4"])}
         return self._receiver(recon, ctx)
 
-    # ---- optimiser plumbing (delegate to bottleneck(s)) ----
+    # ---- Stage 1 optimiser plumbing (delegate to bottleneck(s)) ----
     def _bns(self):
         return [self.bottleneck] + ([self.s4_bottleneck] if self.s4_bottleneck is not None else [])
 
@@ -114,12 +138,52 @@ class SplitStudent(nn.Module):
     def update(self, force=True):
         return all(bn.update(force=force) for bn in self._bns())
 
+    # ---- Stage 2: fine-tune the receiver tail (spec §5.2) ----
+    def receiver_modules(self):
+        """The teacher modules DOWNSTREAM of the cut (= the receiver tail). Stage 2
+        unfreezes and fine-tunes exactly these; the sender encoder + bottleneck stay
+        frozen so the deployed send-side (and its entropy model) is fixed."""
+        t = self.teacher
+        if self.split == "neck":
+            mods = [t.decoder]
+        else:
+            sender = _SENDER_BB[self.split]
+            mods = [getattr(t.backbone, n) for n in _ALL_BB if n not in sender]
+            mods += [t.neck, t.decoder]
+        mods += list(t.heads.values())
+        return mods
+
+    def receiver_parameters(self):
+        seen, out = set(), []
+        for m in self.receiver_modules():
+            for p in m.parameters():
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    out.append(p)
+        return out
+
+    def set_stage2_trainable(self):
+        """Freeze bottleneck(s) + sender; unfreeze the receiver tail. Run the Stage-2
+        loop with the student in eval() mode (frozen BN running stats; only the tail
+        conv/linear weights update)."""
+        for bn in self._bns():
+            for p in bn.parameters():
+                p.requires_grad_(False)
+        for p in self.receiver_parameters():
+            p.requires_grad_(True)
+
 
 def split_in_channels(teacher, split):
-    """Channels of the main feature that crosses the split (drives the bottleneck width)."""
-    if split == "late":
+    """Channels of the feature(s) that cross the split (drives the bottleneck width).
+    Single int for early/neck; (c_high, c_low) tuple for the dual mid/late payload."""
+    oc = teacher.backbone.out_channels               # {s4:c1, s8:c2, s16:c3, s32:c4}
+    if split == "neck":
         return teacher.neck.out_channels
-    return teacher.backbone.out_channels["s8"]       # stage2 feature channels (c2)
+    if split == "early":
+        return oc["s8"]                              # stage2 feature channels (c2)
+    if split == "mid":
+        return (oc["s8"], oc["s16"])                 # (x_h c2=128, x_l c3=256)
+    return (oc["s8"], oc["s32"])                     # late: (x_h c2=128, x_l c4=512)
 
 
 def build_student(cfg, teacher):

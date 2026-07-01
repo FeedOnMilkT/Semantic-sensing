@@ -1,0 +1,8 @@
+# MID Stage 1 — Hailo variant (Conv+BN+ReLU instead of GDN/IGDN). Same recipe as
+# phase2_mid_stage1.yaml; only the bottleneck activation tier changes, so the RD gap
+# between the two = the cost of dropping GDN for DFC-compilability (spec §4.2 / §8.6).
+_base_: phase2_mid_stage1.yaml
+
+bottleneck:
+  args:
+    act: convbn

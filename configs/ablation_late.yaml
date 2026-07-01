@@ -1,0 +1,20 @@
+# Ablation B — LATE split (RD-vs-cut-depth, deep end). Cut AFTER stage5: the attention
+# blocks (stage4/5) run on the SENDER -> NOT a deployable arm (violates "sender = pure
+# conv", spec §3.1) — kept only to draw the RD-vs-cut-depth curve. DUAL payload
+# (x_h 1/8 c2=128, x_l 1/32 c4=512). Same dual-latent bottleneck recipe as the mid main
+# line; only the split point changes. Teacher = paperhead (clean passthrough(s8) tail).
+_base_: ade20k_rtformer_paperhead.yaml
+
+student:
+  split: late
+  stage1_epochs: 100           # real schedule; NEVER 1
+
+bottleneck:
+  name: rtformer_distill
+  args:
+    latent_channels: 128
+    hyper_channels: 128
+    hidden: 128
+    num_down: 1
+    hyper_down: 1
+    act: gdn

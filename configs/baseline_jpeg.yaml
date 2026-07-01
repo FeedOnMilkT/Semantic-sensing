@@ -1,0 +1,11 @@
+# External baseline — JPEG (spec §6). Encode the ORIGINAL image at a sweep of quality
+# factors -> decode -> run the FROZEN teacher -> (bpp, mIoU). The only external arm the
+# main mid curve is compared against (the learned codec should sit ABOVE this at equal
+# bpp, spec §9). bpp = JPEG file bits / (H×W image pixels) — same normalisation as the
+# learned arms so the curves are comparable. Teacher = paperhead (same frozen tail).
+#   python tools/jpeg_baseline.py configs/baseline_jpeg.yaml \
+#     --teacher-ckpt .../ade20k_rtformer_paperhead.pth
+_base_: ade20k_rtformer_paperhead.yaml
+
+jpeg:
+  qualities: [10, 20, 30, 40, 50, 70, 90]   # sweep Q -> bpp axis

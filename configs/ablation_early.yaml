@@ -1,0 +1,21 @@
+# Ablation A — EARLY split (RD-vs-cut-depth, shallow end). Cut at the stage2 feature
+# (pre dual-resolution fork): sender = stem+stage1+stage2 (pure conv, ALL attention on
+# the receiver — the SegFormer-impossible advantage). SINGLE latent (the dual branches
+# only form at stage3). Teacher = paperhead (passthrough(s8)) so the s4 scale is unused
+# by the tail -> NO s4 bypass needed; only the stage2 feature is compressed.
+_base_: ade20k_rtformer_paperhead.yaml
+
+student:
+  split: early
+  stage1_epochs: 100           # real schedule; NEVER 1
+  compress_s4: false           # paper passthrough(s8) tail ignores s4 -> nothing else to ship
+
+bottleneck:
+  name: hyperprior             # single-branch mean-scale hyperprior
+  args:
+    latent_channels: 128
+    hyper_channels: 128
+    hidden: 128
+    num_down: 1
+    hyper_down: 1
+    act: gdn                   # main RD; convbn variant via override

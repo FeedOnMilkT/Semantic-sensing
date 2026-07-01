@@ -1,0 +1,29 @@
+# ★ Phase-2 MAIN LINE — MID split, Stage 1 (learn the compressible representation).
+#
+# Cut AFTER stage3 (RTFormer conv->attention boundary, spec §3). Dual payload
+# (x_h 1/8 c2=128, x_l 1/16 c3=256) crosses the channel; NO s4 (paper passthrough(s8)
+# tail). Teacher = FROZEN ade20k_rtformer_paperhead (passthrough+DAPPM+3x3 head, 36.55)
+# — the clean spec tail so the payload is exactly the two stage3 branches.
+#
+# Stage 1 (spec §5.1): freeze the sender encoder (copied from teacher) + frozen tail;
+# train ONLY the dual-latent bottleneck with L = feature_MSE(x̂_h,x̂_l vs teacher) + β·rate.
+# Sweep β across runs (--beta) for the bpp-mIoU curve (configs/phase2_betasweep.yaml).
+#
+#   CUDA_VISIBLE_DEVICES=1 python tools/train_student.py configs/phase2_mid_stage1.yaml \
+#     --teacher-ckpt /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth \
+#     --beta 0.01 --out /data/sidney/checkpoints/semantic-sensing/students/mid_b0.01_s1.pth
+_base_: ade20k_rtformer_paperhead.yaml
+
+student:
+  split: mid
+  stage1_epochs: 100          # real schedule (~126k iters @ batch16, teacher-scale); NEVER 1
+
+bottleneck:
+  name: rtformer_distill       # dual-latent / single-container (two mean-scale hyperpriors)
+  args:
+    latent_channels: 128       # M (main latent) — core compression knob, paired with β
+    hyper_channels: 128        # N (hyper latent)
+    hidden: 128
+    num_down: 1                # one stride-2 in g_a (spatial + channel compression)
+    hyper_down: 1
+    act: gdn                   # MAIN RD curve (Ballé GDN/IGDN). Hailo variant: override act: convbn

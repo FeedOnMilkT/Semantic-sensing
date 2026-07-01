@@ -1,0 +1,13 @@
+# β-sweep driver (spec §5.4). Each β = one independent Stage1(+Stage2) run sharing the
+# SAME frozen teacher; the points form the bpp-mIoU curve. Consumed by a shell loop over
+# tools/train_student.py (one process per β), e.g.:
+#
+#   for b in 0.001 0.003 0.01 0.03 0.1; do
+#     CUDA_VISIBLE_DEVICES=1 python tools/train_student.py configs/phase2_mid_stage1.yaml \
+#       --teacher-ckpt .../ade20k_rtformer_paperhead.pth --beta $b \
+#       --out .../students/mid_b${b}_s1.pth
+#   done
+#
+# then aggregate the [POINT] lines with tools/eval_rd_curve.py.
+base_config: configs/phase2_mid_stage1.yaml
+betas: [0.001, 0.003, 0.01, 0.03, 0.1]   # core compression knob (β·rate weight)

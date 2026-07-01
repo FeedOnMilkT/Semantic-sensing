@@ -164,7 +164,7 @@ def make_split_checks(split, cfg):
 if __name__ == "__main__":
     print(f"[smoke_student_split] device={DEVICE} size={SIZE}")
     check("#0a RTFormer forward == forward_receiver(forward_sender)", c0a_backbone_refactor_equivalence)
-    for split, path in (("late", "configs/student_rtformer_late.yaml"),
+    for split, path in (("neck", "configs/student_rtformer_late.yaml"),
                         ("early", "configs/student_rtformer_early.yaml")):
         cfg = load_config(path)
         for name, fn in make_split_checks(split, cfg):

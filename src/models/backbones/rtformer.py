@@ -213,18 +213,34 @@ class RTFormer(nn.Module):
         high = self.stage2(s4)                        # 1/8, c2  (early split feature)
         return s4, high
 
+    def _stage3(self, high):
+        """Stage3 dual-resolution BASIC blocks + DDRNet bilateral fusion. Input = the
+        stage2 high feature (1/8, c2); returns the fused dual pair
+          (x_h 1/8 c2, x_l 1/16 c3)
+        = the conv->attention boundary (the MID split point, paper-faithful: this is
+        exactly the (x3_, x3) payload of phase2 spec §3.1, no s4)."""
+        h3 = self.s3_high(high)
+        l3 = self.s3_low(high)
+        x_h = F.relu(h3 + self._up(self.s3_l2h(l3), h3), inplace=True)   # 1/8, c2
+        x_l = F.relu(l3 + self.s3_h2l(h3), inplace=True)                 # 1/16, c3
+        return x_h, x_l
+
+    def _stage45(self, x_h, x_l):
+        """Stage4/5 RTFormer blocks (attention) from the stage3 pair. Returns
+        (high, low) = (1/8 c2, 1/32 c4), BEFORE the DAPPM seg-head context (= the
+        LATE split point payload (x5_, x5))."""
+        high, low = self.stage4(x_h, x_l)             # low -> 1/32, c4
+        high, low = self.stage5(high, low)            # low stays 1/32, c4
+        return high, low
+
     def _receiver_trunk(self, s4, high):
         """Receive-side trunk from the stage2 feature: stage3 (dual + bilateral
         fusion) + stage4/5. Returns (s4, high_pre_dappm, s16, s32). The old in-line
         trunk now lives here so forward()/forward_trunk()/forward_receiver() share it
         verbatim (behaviour-identical)."""
-        h3 = self.s3_high(high)
-        l3 = self.s3_low(high)
-        high = F.relu(h3 + self._up(self.s3_l2h(l3), h3), inplace=True)
-        low = F.relu(l3 + self.s3_h2l(h3), inplace=True)
-        s16 = low                                     # 1/16, c3
-        high, low = self.stage4(high, low)            # low -> 1/32, c4
-        high, low = self.stage5(high, low)            # low stays 1/32, c4
+        x_h, x_l = self._stage3(high)
+        s16 = x_l                                     # 1/16, c3
+        high, low = self._stage45(x_h, x_l)
         return s4, high, s16, low
 
     def _features(self, x):
@@ -239,6 +255,37 @@ class RTFormer(nn.Module):
         s4, high, s16, s32 = self._receiver_trunk(s4, high)
         high = F.relu(high + self._up(self.dappm(s32), high), inplace=True)
         return {"s4": s4, "s8": high, "s16": s16, "s32": s32}
+
+    # ---- MID split (phase2 main line): cut after stage3, payload (x_h, x_l) ----
+    def forward_sender_mid(self, x):
+        """Send-side of the MID split: pure-conv stem+stage1+stage2+stage3
+        (Hailo-foldable, NO attention). Returns the dual payload that crosses the
+        channel: (x_h 1/8 c2, x_l 1/16 c3) = phase2 spec §3.1 (x3_, x3). NO s4 needs
+        to cross — the receiver tail is the paper head (passthrough(s8)+DAPPM)."""
+        high = self.forward_sender(x)[1]              # pure conv up to stage2 (s4 not needed at mid)
+        return self._stage3(high)                     # (x_h, x_l)
+
+    def forward_receiver_mid(self, x_h, x_l):
+        """Receive-side of the MID split: stage4/5 (attention) + DAPPM context fused
+        into the stride-8 feature, from the (reconstructed) stage3 pair. s4 is None
+        (produced pre-stage2 on the sender; the paper passthrough(s8) head ignores it)."""
+        high, low = self._stage45(x_h, x_l)
+        high = F.relu(high + self._up(self.dappm(low), high), inplace=True)
+        return {"s4": None, "s8": high, "s16": x_l, "s32": low}
+
+    # ---- LATE split (deep ablation): cut after stage5, payload (x5_, x5) ----
+    def forward_sender_late(self, x):
+        """Send-side of the LATE split: the whole backbone trunk through stage5
+        (so the attention blocks run on the SENDER — NOT deployable, ablation only).
+        Returns (high 1/8 c2, low 1/32 c4) = phase2 spec §3.1 (x5_, x5), pre-DAPPM."""
+        x_h, x_l = self.forward_sender_mid(x)
+        return self._stage45(x_h, x_l)
+
+    def forward_receiver_late(self, x_h, x_l):
+        """Receive-side of the LATE split: only the DAPPM seg-head context + fuse.
+        s4/s16 are None (the passthrough(s8) head ignores them)."""
+        high = F.relu(x_h + self._up(self.dappm(x_l), x_h), inplace=True)
+        return {"s4": None, "s8": high, "s16": None, "s32": x_l}
 
     def forward(self, x):
         s4, high, s16, s32 = self._features(x)

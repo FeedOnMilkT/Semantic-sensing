@@ -27,12 +27,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
+from compressai.layers import GDN
 
 
 def _cbr(cin, cout, stride=1):
     return nn.Sequential(
         nn.Conv2d(cin, cout, 3, stride, 1, bias=False),
         nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
+
+
+def _block(cin, cout, stride=1, act="convbn", inverse=False):
+    """One analysis/synthesis stage. `act` picks the non-linearity:
+      - "convbn" : Conv + BN + ReLU              (Hailo-foldable; the deployable variant)
+      - "gdn"    : Conv + (I)GDN                  (Ballé's divisive norm; the optimal LIC
+                   variant CompressAI uses, but GDN may not compile on Hailo DFC).
+    `inverse=True` uses IGDN (synthesis side). The two activation tiers let us report
+    the RD gap (phase2 spec §4.2: GDN = main RD curve, convbn = Hailo variant)."""
+    conv = nn.Conv2d(cin, cout, 3, stride, 1, bias=(act == "gdn"))
+    if act == "gdn":
+        return nn.Sequential(conv, GDN(cout, inverse=inverse))
+    if act == "convbn":
+        return nn.Sequential(conv, nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
+    raise ValueError(f"unknown bottleneck act '{act}' (expected gdn|convbn)")
 
 
 def _scale_table(smin=0.11, smax=256.0, levels=64):
@@ -42,15 +58,16 @@ def _scale_table(smin=0.11, smax=256.0, levels=64):
 
 class _Analysis(nn.Module):
     """Conv stack reducing channels with `num_down` stride-2 steps -> latent (no
-    final activation: latents are signed)."""
-    def __init__(self, c_in, c_out, hidden, num_down):
+    final activation: latents are signed). `act` = gdn|convbn (the hyper transforms
+    pass convbn; the main g_a passes the configured tier)."""
+    def __init__(self, c_in, c_out, hidden, num_down, act="convbn"):
         super().__init__()
         layers, c = [], c_in
         for _ in range(num_down):
-            layers.append(_cbr(c, hidden, stride=2))
+            layers.append(_block(c, hidden, stride=2, act=act))
             c = hidden
         if num_down == 0:
-            layers.append(_cbr(c, hidden, 1))
+            layers.append(_block(c, hidden, 1, act=act))
             c = hidden
         layers.append(nn.Conv2d(c, c_out, 3, 1, 1))
         self.net = nn.Sequential(*layers)
@@ -60,14 +77,15 @@ class _Analysis(nn.Module):
 
 
 class _Synthesis(nn.Module):
-    """Conv stack mirroring `num_up` bilinear upsamples -> output (no final activation)."""
-    def __init__(self, c_in, c_out, hidden, num_up):
+    """Conv stack mirroring `num_up` bilinear upsamples -> output (no final
+    activation). `act` = gdn|convbn (gdn -> IGDN on the up blocks)."""
+    def __init__(self, c_in, c_out, hidden, num_up, act="convbn"):
         super().__init__()
-        self.head = _cbr(c_in, hidden, 1)
+        self.head = _block(c_in, hidden, 1, act=act, inverse=True)
         self.ups = nn.ModuleList(
             nn.Sequential(
                 nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                _cbr(hidden, hidden, 1))
+                _block(hidden, hidden, 1, act=act, inverse=True))
             for _ in range(num_up))
         self.proj = nn.Conv2d(hidden, c_out, 3, 1, 1)
 
@@ -80,22 +98,37 @@ class _Synthesis(nn.Module):
 
 class HyperpriorBottleneck(nn.Module):
     def __init__(self, in_channels, latent_channels=128, hyper_channels=128,
-                 hidden=128, num_down=1, hyper_down=1):
+                 hidden=128, num_down=1, hyper_down=1, act="convbn"):
         super().__init__()
         self.in_channels = in_channels
         self.num_down = num_down
-        self.g_a = _Analysis(in_channels, latent_channels, hidden, num_down)
-        self.g_s = _Synthesis(latent_channels, in_channels, hidden, num_down)
+        self.act = act
+        # main transforms use the configured activation tier (gdn|convbn); the hyper
+        # transforms stay conv+ReLU (spec §4.2: "标准 hyper analysis/synthesis Conv+ReLU").
+        self.g_a = _Analysis(in_channels, latent_channels, hidden, num_down, act=act)
+        self.g_s = _Synthesis(latent_channels, in_channels, hidden, num_down, act=act)
         self.h_a = _Analysis(latent_channels, hyper_channels, hidden, hyper_down)
         self.h_s = _Synthesis(hyper_channels, latent_channels * 2, hidden, hyper_down)  # -> means, scales
         self.entropy_bottleneck = EntropyBottleneck(hyper_channels)   # factorized prior on z
         self.gaussian_conditional = GaussianConditional(None)         # conditional coder for y
 
+    def _hyper_params(self, z_hat, y_hw):
+        """(means, scales) from the hyper-synthesis, aligned to the latent y's spatial
+        size y_hw. The down->up rounding in h_a/h_s can land 1 px off when the latent is
+        tiny/odd, so snap to y_hw (no-op at deployment sizes). compress/decompress must
+        pass the SAME y_hw (stored in the payload) or the coder desyncs."""
+        y_hw = tuple(y_hw)
+        means, scales = self.h_s(z_hat).chunk(2, dim=1)
+        if means.shape[-2:] != y_hw:
+            means = F.interpolate(means, size=y_hw, mode="bilinear", align_corners=False)
+            scales = F.interpolate(scales, size=y_hw, mode="bilinear", align_corners=False)
+        return means, scales
+
     def forward(self, f):
         y = self.g_a(f)
         z = self.h_a(y)
         z_hat, z_lik = self.entropy_bottleneck(z)
-        means, scales = self.h_s(z_hat).chunk(2, dim=1)
+        means, scales = self._hyper_params(z_hat, y.shape[-2:])
         y_hat, y_lik = self.gaussian_conditional(y, scales, means=means)
         f_hat = self.g_s(y_hat)
         if f_hat.shape[-2:] != f.shape[-2:]:                # guard odd sizes
@@ -108,16 +141,16 @@ class HyperpriorBottleneck(nn.Module):
         z = self.h_a(y)
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.shape[-2:])
-        means, scales = self.h_s(z_hat).chunk(2, dim=1)
+        means, scales = self._hyper_params(z_hat, y.shape[-2:])
         indexes = self.gaussian_conditional.build_indexes(scales)
         y_strings = self.gaussian_conditional.compress(y, indexes, means=means)
         return {"strings": [y_strings, z_strings], "z_shape": tuple(z.shape[-2:]),
-                "feat_hw": tuple(f.shape[-2:])}
+                "y_shape": tuple(y.shape[-2:]), "feat_hw": tuple(f.shape[-2:])}
 
     def decompress(self, payload):
         y_strings, z_strings = payload["strings"]
         z_hat = self.entropy_bottleneck.decompress(z_strings, payload["z_shape"])
-        means, scales = self.h_s(z_hat).chunk(2, dim=1)
+        means, scales = self._hyper_params(z_hat, payload["y_shape"])
         indexes = self.gaussian_conditional.build_indexes(scales)
         y_hat = self.gaussian_conditional.decompress(y_strings, indexes, means=means)
         f_hat = self.g_s(y_hat)

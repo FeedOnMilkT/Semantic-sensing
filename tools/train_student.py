@@ -25,7 +25,7 @@ from src import _compat  # noqa: F401  shim before CompressAI
 from src.utils import load_config, get_logger
 from src.models import build_model
 from src.models.student import build_student
-from src.engine import StudentTrainer, evaluate_student
+from src.engine import StudentTrainer, Stage2Trainer, evaluate_student
 from src.datasets import collate
 from src.datasets.synthetic import SyntheticMultiTask
 
@@ -36,10 +36,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("config", help="student config (configs/student_rtformer_{early,late}.yaml)")
     ap.add_argument("--teacher-ckpt", default=None, help="trained RTFormer teacher .pth (frozen)")
+    ap.add_argument("--stage", type=int, default=1, choices=[1, 2],
+                    help="1 = train bottleneck (feature-MSE + beta*rate); 2 = freeze bottleneck, "
+                         "fine-tune receiver tail (CE+Dice)")
+    ap.add_argument("--student-ckpt", default=None, help="Stage-1 student .pth to load before Stage 2")
     ap.add_argument("--beta", type=float, default=0.01, help="rate weight (sweep this for the curve)")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--aux-lr", type=float, default=1e-3)
-    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--epochs", type=int, default=None,
+                    help="train epochs. Default = per-stage config (Stage1 student.stage1_epochs / "
+                         "Stage2 stage2.epochs), NEVER a silent 1. --smoke uses 1 (synthetic wiring check only).")
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--task-weight", type=float, default=0.0, help=">0 adds task loss (ICM arm)")
     ap.add_argument("--batch-size", type=int, default=None, help="override per-step batch size")
@@ -63,8 +69,12 @@ def main():
         teacher.load_state_dict(state["model"])
         log.info(f"loaded teacher {args.teacher_ckpt}")
     student = build_student(cfg, teacher).to(device)
+    if args.student_ckpt:                                 # resume a Stage-1 student (for Stage 2)
+        sd = torch.load(args.student_ckpt, map_location="cpu")
+        student.load_state_dict(sd["student"])
+        log.info(f"loaded student {args.student_ckpt}")
     n_codec = sum(p.numel() for p in student.codec_parameters()) / 1e6
-    log.info(f"split={cfg.student.split} bottleneck={cfg.bottleneck.name} "
+    log.info(f"split={cfg.student.split} stage={args.stage} bottleneck={cfg.bottleneck.name} "
              f"in_ch={student.bottleneck.in_channels} codec_params={n_codec:.2f}M device={device}")
 
     # ---- data ----
@@ -79,20 +89,42 @@ def main():
         if args.val_limit:                                # fast, teacher-comparable sanity eval
             from torch.utils.data import Subset
             from src.datasets import build_dataset
-            vds = Subset(build_dataset(cfg.data.val), range(args.val_limit))
+            full_val = build_dataset(cfg.data.val)
+            n = min(args.val_limit, len(full_val))        # clamp: never index past the val set
+            vds = Subset(full_val, range(n))
             val_loader = DataLoader(vds, batch_size=4, shuffle=False, collate_fn=collate)
         else:
             val_loader = make_loader(cfg.data.val, cfg.eval.get("batch_size", 4), shuffle=False)
 
+    # ---- resolve epochs: real per-stage config default, NEVER a silent 1 ----
+    if args.smoke:
+        epochs = args.epochs or 1                     # synthetic wiring check only
+    elif args.stage == 2:
+        epochs = args.epochs or int(cfg.get("stage2", {}).get("epochs", 20))
+    else:
+        epochs = args.epochs or int(OmegaConf.select(cfg, "student.stage1_epochs") or 100)
+    log.info(f"training stage={args.stage} epochs={epochs} (real schedule)")
+
     # ---- train ----
-    tcfg = OmegaConf.create({
-        "optimizer": {"lr": args.lr, "weight_decay": 0.0}, "aux_lr": args.aux_lr,
-        "scheduler": "poly", "warmup": 0, "grad_clip": 1.0,
-        "task_weight": args.task_weight, "ignore_index": ignore_index,
-    })
-    trainer = StudentTrainer(tcfg, student, beta=args.beta, device=device)
-    trainer.fit(train_loader, epochs=args.epochs, max_steps=args.max_steps,
-                log_every=cfg.train.get("log_every", 20))
+    if args.stage == 2:
+        # resolve ${num_classes}/${ignore_index} against the full cfg BEFORE detaching
+        s2cfg = OmegaConf.create(OmegaConf.to_container(cfg.get("stage2", {}), resolve=True))
+        s2cfg.setdefault("num_classes", num_classes)
+        s2cfg.setdefault("ignore_index", ignore_index)
+        if "optimizer" not in s2cfg:
+            s2cfg.optimizer = {"lr": args.lr, "weight_decay": 0.01}
+        trainer = Stage2Trainer(s2cfg, student, device=device)
+        trainer.fit(train_loader, epochs=epochs, max_steps=args.max_steps,
+                    log_every=cfg.train.get("log_every", 20))
+    else:
+        tcfg = OmegaConf.create({
+            "optimizer": {"lr": args.lr, "weight_decay": 0.0}, "aux_lr": args.aux_lr,
+            "scheduler": "poly", "warmup": 0, "grad_clip": 1.0,
+            "task_weight": args.task_weight, "ignore_index": ignore_index,
+        })
+        trainer = StudentTrainer(tcfg, student, beta=args.beta, device=device)
+        trainer.fit(train_loader, epochs=epochs, max_steps=args.max_steps,
+                    log_every=cfg.train.get("log_every", 20))
 
     # ---- eval: the bpp-mIoU point ----
     if not args.no_eval:

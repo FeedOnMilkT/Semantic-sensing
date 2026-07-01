@@ -42,10 +42,22 @@ def _build_hyperprior(cfg, in_channels):
     return HyperpriorBottleneck(in_channels=in_channels, **cfg.get("args", {}))
 
 
+def _build_rtformer_distill(cfg, in_channels):
+    """Dual-latent / single-container bottleneck (phase2 MID/LATE main line).
+    `in_channels` must be a (c_high, c_low) tuple (set by build_student from the
+    split's two-branch channels)."""
+    from .rtformer_distill import DualLatentBottleneck   # lazy: imports CompressAI on demand
+    if not (isinstance(in_channels, (tuple, list)) and len(in_channels) == 2):
+        raise ValueError("rtformer_distill needs in_channels=(c_high, c_low) for the dual payload")
+    c_high, c_low = in_channels
+    return DualLatentBottleneck(in_channels_high=c_high, in_channels_low=c_low, **cfg.get("args", {}))
+
+
 _BOTTLENECKS = {
-    "identity": _build_identity,            # no-op (seg / Phase 1)
-    "compression": _build_compression,      # factorized EntropyBottleneck (de-risk baseline)
-    "hyperprior": _build_hyperprior,        # mean-scale hyperprior (full / optimal-deployable)
+    "identity": _build_identity,                  # no-op (seg / Phase 1)
+    "compression": _build_compression,            # factorized EntropyBottleneck (de-risk baseline)
+    "hyperprior": _build_hyperprior,              # mean-scale hyperprior (full / optimal-deployable)
+    "rtformer_distill": _build_rtformer_distill,  # dual-latent / single-container (MID/LATE main line)
 }
 
 

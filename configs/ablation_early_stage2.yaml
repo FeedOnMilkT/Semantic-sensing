@@ -1,0 +1,18 @@
+# EARLY split, Stage 2 (tail fine-tune). Same recipe as phase2_mid_stage2.yaml; only
+# the split differs (inherited from ablation_early.yaml -> split: early).
+_base_: ablation_early.yaml
+
+stage2:
+  epochs: 20
+  num_classes: ${num_classes}
+  ignore_index: ${ignore_index}
+  seg_loss:
+    w_ce: 1.0
+    w_dice: 1.0
+    w_lovasz: 0.0
+  optimizer:
+    lr: 1.0e-4
+    weight_decay: 0.01
+  scheduler: poly
+  warmup: 0
+  grad_clip: 1.0

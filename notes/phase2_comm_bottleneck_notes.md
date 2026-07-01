@@ -97,7 +97,9 @@ f --g_a(analysis)--> y --EntropyBottleneck(量化+学习rate)--> y_hat --g_s(syn
     **bpp=1.467, mIoU=0.306, pixel_acc=0.757**。即低 β 下 student 几乎追回 teacher（0.306 vs 0.334，
     **−0.028 / ~9% 相对，仅训 1 epoch**）。**整条真实管道端到端验证通过。**
     ckpt: `students/late_b0.001_sanity.pth`。
-  - 注：`--epochs` 默认 1，所以 `--max-steps 10000` 被 1 epoch（2526 步）截断；要更多步设 `--epochs`。
+  - ⚠️ 已废弃的坑（2026-06-30 修复）：`--epochs` 曾默认 **1**，导致 sanity 跑只训 1 epoch（严重欠训、
+    mIoU 塌）。现 `train_student.py` `--epochs` 默认 **None → 走 per-stage 真实排期**（Stage1
+    `student.stage1_epochs`=100 / Stage2 `stage2.epochs`=20），`--smoke` 才用 1。**不再有静默 1-epoch。**
 - ✅ **③ early 的 s4 旁路码率计入（done, 2026-06-30）**：`student.compress_s4: true` 给 early 加第二个
   hyperprior 压 s4，bpp 计入两路。三方对照（β=0.001，1 epoch，val-128，teacher 上界 mIoU 0.334）：
 
@@ -115,3 +117,53 @@ f --g_a(analysis)--> y --EntropyBottleneck(量化+学习rate)--> y_hat --g_s(syn
 - **β 扫描**：late 与 early 各扫 β∈{0.002,0.005,0.01,0.02,0.05}，训到收敛、全 val，画两条 bpp-mIoU 曲线。
 - s4 bottleneck 调参（latent/num_down），让 early 曲线公平且最优。
 - 部署对比表：送端 FLOPs/params + 注意力在哪端（early 纯卷积 vs late 含注意力）。
+
+---
+
+# 更新（2026-06-30 续 II）：中切主线 dual-latent bottleneck + Stage2（按 phase2_rtformer_distill_prompt.md）
+
+> 实现 spec 的**中切主线**（stage3 后 conv→attention 边界，双支紧致 payload）+ 双 latent/
+> 单容器 bitstream + 两阶段蒸馏。**只写代码不训练**（Sidney 本轮明确）；全部 smoke/pytest 绿。
+
+## 关键决策（与 Sidney 对齐后锁定）
+- **teacher = `ade20k_rtformer_paperhead`（passthrough(s8)+DAPPM+3x3 头, 36.55）**。原因：generic
+  head 的 mlp_fusion 会重融 4 尺度、逼着 s4（1/4 大图）过信道、码率被它主导、破坏"干净中切"故事；
+  paperhead 的 tail 只吃 s8 → 中切 payload **正好 = (x_h 128@1/8, x_l 256@1/16) 两支，无 s4**，合 spec。
+  天花板低 1.6 点但论文报相对 RD 曲线，不影响对比。
+- **激活两档都建**：GDN/IGDN = 主 RD 曲线；convbn = Hailo 可折叠档（报掉点）。
+- **三切分按 spec 重定义**：early(stage2,单)/ **mid(stage3,双,主线)** / late(stage5,双)。旧 "late"=neck
+  语义迁到 split 名 `neck`（`student_rtformer_late.yaml` + smoke 已改），保旧 9/9 不破。
+
+## 落点（全在 src/ 模块框架内，无新 phase2/ 树）
+- `models/backbones/rtformer.py`：加 `forward_sender_mid/receiver_mid`（stage3 后切，等价）+
+  `forward_sender_late/receiver_late`（stage5 后切）。抽出 `_stage3`/`_stage45`。forward() 不变。
+- `models/bottlenecks/hyperprior.py`：加 `act: gdn|convbn`（主 g_a/g_s；hyper 仍 conv+ReLU）。
+  `_hyper_params` 把 means/scales 对齐 y 尺寸（奇数/小尺寸鲁棒），payload 存 `y_shape`，
+  compress/decompress 同步对齐。
+- `models/bottlenecks/rtformer_distill.py`：**新** `DualLatentBottleneck` = 两个独立
+  HyperpriorBottleneck（high/low）+ 单容器序列化 `_pack/_unpack`（magic RTFD | n | 每支 z/y 串）。
+  工厂注册 `rtformer_distill`（in_channels=(c_high,c_low)）。
+- `models/student.py`：`SplitStudent` 支持 early/mid/late/neck；mid/late 走双支、元组 target/recon；
+  暴露 `receiver_modules/receiver_parameters/set_stage2_trainable`（Stage2 微调接收端 tail）。
+- `engine/student_trainer.py`：`_distortion` 支持元组（双支 feature-MSE 求和）；**新** `Stage2Trainer`
+  （冻 encoder+bottleneck，eval 模式量化态，微调 tail，L=CE+Dice，Lovász 开关）。
+- `tools/train_student.py`：加 `--stage 1|2` + `--student-ckpt`（Stage2 载 Stage1 student）。
+- configs：`phase2_mid_stage1.yaml`(主线,GDN)/`_convbn`/`phase2_mid_stage2.yaml` /
+  `ablation_early.yaml`(单latent,compress_s4=false 因 passthrough 不用 s4)/`ablation_late.yaml` /
+  `phase2_betasweep.yaml` / `baseline_jpeg.yaml`。均 `_base_: ade20k_rtformer_paperhead.yaml`。
+
+## 验证（全绿，CPU）
+- `tests/`（pytest, 8/8 稳定，单线程避 CompressAI erfc 段错误）：
+  - test_split_equivalence：identity bottleneck 下 encoder+tail==teacher（early/mid/late/neck）+
+    backbone refactor 无损（mid/late s8/s16/s32 == forward）。
+  - test_bottleneck_contract：dual 契约 + GDN/convbn 两档 + codec 有梯度。
+  - test_bitstream_roundtrip：单容器 pack/unpack 逆 + roundtrip==eval forward。
+  - test_rate_vs_filesize：估计 bpp ≈ 实测容器 bit（<20%）。
+  - 跑法：`CUDA_VISIBLE_DEVICES="" PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/ -q`
+- smoke（合成数据，CPU）：MID Stage1(GDN/convbn)、MID Stage2、EARLY 均出 [POINT]；
+  既有 `smoke_student_split.py` 9/9（neck+early）、`smoke_test.py` 5/5、`smoke_student.py` 4/4 不破。
+
+## 真正的下一步（训练态，需 Sidney green-light GPU）
+- 用真 paperhead teacher 跑 mid Stage1 单 β sanity（验证重建特征过冻结 tail 掉点 <2）→ Stage2 → β 扫描。
+- 待补**代码**（Step 5/6，本轮未写）：`tools/eval_rd_curve.py`（汇总 [POINT]→csv/png）、
+  `tools/jpeg_baseline.py`（扫 Q）、`tools/export_onnx.py` 发送端/接收端预检、`viz_latent.py`。

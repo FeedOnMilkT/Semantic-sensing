@@ -1,12 +1,14 @@
-# Late-split student (V2 / semantic waist).
+# NECK-split student (legacy V2 / semantic waist de-risk arm).
 # Split at the neck output (single fused tensor, after the whole backbone). Sender =
 # backbone + neck ; receiver = decoder + head. The hyperprior bottleneck compresses
-# the fused feature. Teacher = frozen RTFormer with the better-performing GENERIC head
-# (= ade20k_rtformer, bs32 38.2). Only the split point differs from the early variant.
+# the fused feature. Teacher = frozen RTFormer with the GENERIC head (ade20k_rtformer).
+# NOTE: phase2 redefined split names (early|mid|late per spec §3.1, late = after
+# stage5). This legacy arm now uses split: neck to keep its old behaviour; the phase2
+# main line / ablations live in configs/phase2_*.yaml + ablation_*.yaml.
 _base_: ade20k_rtformer.yaml
 
 student:
-  split: late
+  split: neck
 
 bottleneck:
   name: hyperprior            # full mean-scale hyperprior (optimal-deployable)
