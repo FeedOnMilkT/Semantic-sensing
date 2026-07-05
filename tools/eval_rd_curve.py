@@ -28,6 +28,17 @@ from src.engine import evaluate_student
 log = get_logger("rd_curve")
 
 
+# Filename series scanned under --students-dir: (label, glob with {st} slot, plot style).
+# "mid" must exclude the task-weight variants ("mid_b*_tw*") which its glob also matches.
+_SERIES = [
+    ("early",     "early_b*_{st}.pth",      "s--"),
+    ("mid",       "mid_b*_{st}.pth",        "o-"),
+    ("late",      "late_b*_{st}.pth",       "^:"),
+    ("mid-fused", "midf_b*_{st}.pth",       "D-"),   # rtformer_fused bottleneck (workflow §4)
+    ("mid-tw",    "mid_b*_tw*_{st}.pth",    "P-"),   # task-aware Stage 1 (workflow §5)
+]
+
+
 _TEACHER = {"obj": None}                          # built once, shared across all ckpts
 
 
@@ -63,13 +74,16 @@ def main():
 
     stages = ["s1", "s2"] if args.stage == "both" else [args.stage]
     rows = []
-    for split in ["early", "mid", "late"]:
+    for label, pat, _mk in _SERIES:
         for st in stages:
-            for ck in sorted(glob.glob(os.path.join(args.students_dir, f"{split}_b*_{st}.pth"))):
+            paths = sorted(glob.glob(os.path.join(args.students_dir, pat.format(st=st))))
+            if label == "mid":                    # plain-mid glob also matches mid_b*_tw*; keep those in "mid-tw"
+                paths = [p for p in paths if "_tw" not in os.path.basename(p)]
+            for ck in paths:
                 try:
-                    sp, beta, bpp, miou, pa = _eval_ckpt(ck, args.teacher_ckpt, args.val_limit, device)
-                    rows.append((sp, st, beta, bpp, miou, pa))
-                    log.info(f"{sp:5s} {st} beta={beta:<6g} bpp={bpp:.4f} mIoU={miou:.4f} pacc={pa:.4f}")
+                    _sp, beta, bpp, miou, pa = _eval_ckpt(ck, args.teacher_ckpt, args.val_limit, device)
+                    rows.append((label, st, beta, bpp, miou, pa))
+                    log.info(f"{label:9s} {st} beta={beta:<6g} bpp={bpp:.4f} mIoU={miou:.4f} pacc={pa:.4f}")
                 except Exception as e:
                     log.info(f"SKIP {ck}: {e}")
 
@@ -103,10 +117,10 @@ def main():
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(figsize=(7, 5))
-        for split, mk in [("early", "s--"), ("mid", "o-"), ("late", "^:")]:
-            pts = sorted([(b, mi) for sp, st, be, b, mi, pa in rows if sp == split and st == "s2"])
+        for label, _pat, mk in _SERIES:
+            pts = sorted([(b, mi) for sp, st, be, b, mi, pa in rows if sp == label and st == "s2"])
             if pts:
-                ax.plot([p[0] for p in pts], [p[1] for p in pts], mk, label=f"{split} (Stage2)")
+                ax.plot([p[0] for p in pts], [p[1] for p in pts], mk, label=f"{label} (Stage2)")
         if jpeg:
             jp = sorted(jpeg)
             ax.plot([p[0] for p in jp], [p[1] for p in jp], "x-", color="gray", label="JPEG")

@@ -1,0 +1,23 @@
+# Phase-2 MID split FUSED bottleneck, Stage 2 (task fine-tune the receiver tail).
+# Same recipe as phase2_mid_stage2.yaml, on top of the fused Stage-1 student.
+#
+#   CUDA_VISIBLE_DEVICES=1 python tools/train_student.py configs/phase2_mid_fused_stage2.yaml \
+#     --teacher-ckpt .../ade20k_rtformer_paperhead.pth --stage 2 \
+#     --student-ckpt .../students/midf_b0.01_s1.pth \
+#     --out .../students/midf_b0.01_s2.pth
+_base_: phase2_mid_fused_stage1.yaml
+
+stage2:
+  epochs: 20                  # real tail fine-tune schedule; NEVER 1
+  num_classes: ${num_classes}
+  ignore_index: ${ignore_index}
+  seg_loss:
+    w_ce: 1.0
+    w_dice: 1.0
+    w_lovasz: 0.0              # Lovász-Softmax switch (spec §5.2)
+  optimizer:
+    lr: 1.0e-4                 # AdamW, RTFormer-style (tail fine-tune, small budget)
+    weight_decay: 0.01
+  scheduler: poly
+  warmup: 0
+  grad_clip: 1.0

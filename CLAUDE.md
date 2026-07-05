@@ -20,6 +20,27 @@
 
 ---
 
+## ⚑ 当前工作进度（2026-07-05）
+
+**正在执行的主线 workflow：`notes/phase2_fused_latent_workflow_2026-07-04.md`**（新对话恢复工作先读它）。
+
+- 背景：2026-07-02 三 split 全 val 重评（`notes/phase2_eval_2026-07-02_three_splits.md`）发现
+  ① mid 双 latent 独立编码为分支间互信息重复付费（同 β 下 bpp ≈ early 的 3~3.5 倍）；
+  ② Stage1 纯 feature-MSE 目标导致高码率端 mIoU 平台期（加 bit 不涨分）。
+- 对策（详见 workflow 文档）：**方案 A** `rtformer_fused` 融合单 latent bottleneck（L-MSFC 式
+  交错融合，两支捏成一条 y，单 hyperprior）攻 rate 侧；**方案 B** Stage1 掺任务损失
+  （`--task-weight`，ICM 式失真项）攻 quality 侧。A/B 正交，先各自单变量验证再叠加。
+- 进度（2026-07-05）：workflow §6 步骤 2-5 完成——三个训练点跑完并全 val 重评，**A/B 验收均通过**：
+  fused β=0.01 成全场新最优 **0.2852 bpp / 0.3534 mIoU**（对旧 mid 同 β bpp −54.5%、mIoU +0.78 点，
+  半码率压过 JPEG Q30）；fused β=0.003 为 0.4256 / 0.3533；tw0.2（β=0.01）0.4710 / 0.3526，对
+  plain mid 双正信号（bpp −24.9%、mIoU +0.70 点）。结果笔记：`notes/phase2_eval_2026-07-05_fused_taskweight.md`
+  （含与自评交叉核对、验收逐条判定、不利数字）；曲线 `_orch/report_s2_fullval_v2.{csv,png}`。
+- 下一步（workflow §6 步骤 6 决策，已判定走"A/B 均有效"分支）：① 组合点 fused+tw0.2 @ β=0.01
+  （与本轮两点构成 2×2）；② fused β sweep {0.001, 0.003 重跑, 0.03}（NaN 修复后代码统一配方）；
+  ③ 组合为正再扫组合线，详见 07-05 笔记"下一步建议"。
+
+---
+
 ## 硬性约束（务必遵守，与 demo 一脉相承）
 
 1. **不要注册表 / 装饰器**。每类组件用**模块级 dict + `build_X(cfg)`** 工厂：加一个新模块 =

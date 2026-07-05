@@ -161,6 +161,36 @@ def make_split_checks(split, cfg):
     ]
 
 
+def c4_fused_mid_roundtrip():
+    """mid + rtformer_fused: dual-payload forward contract + real single-container
+    (RTFF) bitstream roundtrip reproduces the eval-mode forward reconstruction."""
+    cfg = load_config("configs/phase2_mid_fused_stage1.yaml")
+    teacher = _teacher(cfg)
+    student = build_student(cfg, teacher).to(DEVICE).eval()
+    student.update(force=True)
+    B = 2
+    num_pixels = B * SIZE[0] * SIZE[1]
+    torch.manual_seed(1)
+    x = torch.randn(B, 3, *SIZE, device=DEVICE)
+    with torch.no_grad():
+        out = student(x)
+        assert isinstance(out["recon"], tuple) and len(out["recon"]) == 2, "fused recon not dual"
+        assert set(out["info"]["likelihoods"]) == {"y", "z"}, "fused likelihoods not single y/z"
+        est_bpp = bpp_from_info(out["info"], num_pixels).item()
+        feats, _ = student._sender(x)
+        data = student.bottleneck.compress(feats)
+        assert data[:4] == b"RTFF", "bad fused container magic"
+        r_h, r_l = student.bottleneck.decompress(data)
+        fwd_h, fwd_l = out["recon"]
+    actual_bpp = len(data) * 8 / num_pixels
+    max_diff = max((r_h - fwd_h).abs().max().item(), (r_l - fwd_l).abs().max().item())
+    rel = abs(est_bpp - actual_bpp) / actual_bpp
+    print(f"      [mid/fused] est_bpp={est_bpp:.5f} actual_bpp={actual_bpp:.5f} "
+          f"({len(data)}B) rel={rel*100:.1f}% roundtrip_max|diff|={max_diff:.2e}")
+    assert max_diff < 1e-3, f"[mid/fused] roundtrip not exact: {max_diff:.2e}"
+    assert rel < 0.25, f"[mid/fused] estimated bpp far from actual: {rel*100:.1f}%"
+
+
 if __name__ == "__main__":
     print(f"[smoke_student_split] device={DEVICE} size={SIZE}")
     check("#0a RTFormer forward == forward_receiver(forward_sender)", c0a_backbone_refactor_equivalence)
@@ -169,6 +199,7 @@ if __name__ == "__main__":
         cfg = load_config(path)
         for name, fn in make_split_checks(split, cfg):
             check(name, fn)
+    check("#4  [mid/fused] rtformer_fused single-container roundtrip + bpp match", c4_fused_mid_roundtrip)
     n_ok = sum(RESULTS)
     print(f"\n[smoke_student_split] {n_ok}/{len(RESULTS)} checks passed")
     sys.exit(0 if n_ok == len(RESULTS) else 1)

@@ -1,0 +1,24 @@
+# Phase-2 MID split, FUSED single-latent bottleneck, Stage 1 (fused-latent workflow §4).
+#
+# Same cut / teacher / recipe as phase2_mid_stage1.yaml; ONLY the bottleneck changes:
+# rtformer_fused codes the dual payload (x_h 1/8 c2=128, x_l 1/16 c3=256) with ONE
+# jointly-analysed latent + ONE mean-scale hyperprior (L-MSFC-style interleaved fusion)
+# instead of two independent hyperpriors — the mutual information between the two
+# same-source branches is paid once (workflow §2 diagnosis: mid bpp ≈ 3× early).
+#
+#   CUDA_VISIBLE_DEVICES=1 python tools/train_student.py configs/phase2_mid_fused_stage1.yaml \
+#     --teacher-ckpt /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth \
+#     --beta 0.01 --out /data/sidney/checkpoints/semantic-sensing/students/midf_b0.01_s1.pth
+_base_: phase2_mid_stage1.yaml
+
+bottleneck:
+  name: rtformer_fused
+  args:                        # full args (base merge is deep; state every key)
+    latent_channels: 192       # single fused y @ 1/32 — main ablation knob (256 fallback, §7 risk 2)
+    hyper_channels: 128
+    hidden: 128
+    num_down: 1                # one stride-2 in g_a after the concat (1/16 -> 1/32)
+    hyper_down: 1
+    act: gdn                   # MAIN RD curve. Hailo variant: override act: convbn
+    use_attn: false            # Cheng-style conv sigmoid gate on both latent sides —
+                               # capacity upgrade reserve (§7 risk 2), OFF in v1

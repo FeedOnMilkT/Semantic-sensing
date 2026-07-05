@@ -18,3 +18,16 @@ wandb/
 # 环境
 .venv/
 .ipynb_checkpoints/
+
+# others
+# *.sh
+*.md
+*.txt
+*.json
+# *.yaml
+*.yml
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.xlsm
