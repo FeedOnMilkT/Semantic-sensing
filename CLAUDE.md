@@ -20,7 +20,7 @@
 
 ---
 
-## ⚑ 当前工作进度（2026-07-05）
+## ⚑ 当前工作进度（2026-07-06）
 
 **正在执行的主线 workflow：`notes/phase2_fused_latent_workflow_2026-07-04.md`**（新对话恢复工作先读它）。
 
@@ -30,14 +30,16 @@
 - 对策（详见 workflow 文档）：**方案 A** `rtformer_fused` 融合单 latent bottleneck（L-MSFC 式
   交错融合，两支捏成一条 y，单 hyperprior）攻 rate 侧；**方案 B** Stage1 掺任务损失
   （`--task-weight`，ICM 式失真项）攻 quality 侧。A/B 正交，先各自单变量验证再叠加。
-- 进度（2026-07-05）：workflow §6 步骤 2-5 完成——三个训练点跑完并全 val 重评，**A/B 验收均通过**：
-  fused β=0.01 成全场新最优 **0.2852 bpp / 0.3534 mIoU**（对旧 mid 同 β bpp −54.5%、mIoU +0.78 点，
-  半码率压过 JPEG Q30）；fused β=0.003 为 0.4256 / 0.3533；tw0.2（β=0.01）0.4710 / 0.3526，对
-  plain mid 双正信号（bpp −24.9%、mIoU +0.70 点）。结果笔记：`notes/phase2_eval_2026-07-05_fused_taskweight.md`
-  （含与自评交叉核对、验收逐条判定、不利数字）；曲线 `_orch/report_s2_fullval_v2.{csv,png}`。
-- 下一步（workflow §6 步骤 6 决策，已判定走"A/B 均有效"分支）：① 组合点 fused+tw0.2 @ β=0.01
-  （与本轮两点构成 2×2）；② fused β sweep {0.001, 0.003 重跑, 0.03}（NaN 修复后代码统一配方）；
-  ③ 组合为正再扫组合线，详见 07-05 笔记"下一步建议"。
+- 进度（2026-07-06）：workflow §6 全部完成，**步骤 6 决策落定：主线 = 纯 fused，组合臂
+  （fused+task-weight）负结果关闭、保留为消融**。fused β sweep {0.003, 0.01, 0.03} 三点
+  （0.4256/0.3533、0.2852/0.3534、0.1434/0.3503）全在旧 15 点 pareto 前沿之上，支配整条
+  distill mid 曲线；对 JPEG 重叠质量区 BD-rate **−69.2%**（`tools/bd_rate.py`，本轮新增）。
+  组合点 tw0.2/tw0.5（β=0.01）被纯 fused β=0.03 双指标支配且负效应随 w 单调——方案 B 适用
+  条件修订为"仅对 rate 侧有结构性冗余的 bottleneck 有效"（distill 上 +0.70 点仍成立）。
+  两轮评测统一在 `notes/phase2_eval_2026-07-05_fused_taskweight.md`（第二轮章节含支配关系
+  判定与 BD 数字）；曲线 `_orch/report_s2_fullval_v3.{csv,png}`（v2 保留）。
+- 下一步（候选，均待定未开跑）：fused β=0.001 探高码率端、β=0.003 修复后代码重跑对齐、
+  Cityscapes 跨数据集、Hailo `act: convbn` 导出，见 07-05 笔记末尾"后续候选"。
 
 ---
 
