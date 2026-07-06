@@ -41,6 +41,14 @@
 - 下一步（候选，均待定未开跑）：fused β=0.001 探高码率端、β=0.003 修复后代码重跑对齐、
   Cityscapes 跨数据集、Hailo `act: convbn` 导出，见 07-05 笔记末尾"后续候选"。
 
+- **Phase 2.5 立项（2026-07-06）**：Phase 2 已 commit 闭环；下一阶段四臂并行计划已立项，写入
+  workflow **§9**——A 臂 Stage 2 细化（teacher logit 蒸馏 + 训练预算，攻遗留 teacher ceiling
+  0.3655 − 平台 0.3534 ≈ 1.2 点 gap，已证非码率问题）、B 臂 Hailo 部署验证（convbn 档重训 +
+  sender 子图 ONNX → DFC → 器件延迟）、C 臂 β=0.001 高码率端补点、D 臂实时性评测
+  （latency/throughput 表，新工具 `tools/bench_latency.py` 计划中未写）。均**待跑**。
+  **下一步 = 开跑 A/C/D 臂**（A×3 + C×1 训练卡并行，D 用空卡/间隙测，B 排空卡后）；决策项
+  （解冻 sender）仅当 A 咬不进 1.0 点时启动。详见 workflow §9。
+
 ---
 
 ## 硬性约束（务必遵守，与 demo 一脉相承）
