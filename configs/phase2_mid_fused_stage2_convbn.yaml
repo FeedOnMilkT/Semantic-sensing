@@ -1,0 +1,12 @@
+# Phase-2 MID fused bottleneck, Stage 2 — Hailo convbn variant (B-arm §9.2).
+# Same recipe as phase2_mid_fused_stage2.yaml; act inherited from convbn Stage-1 chain.
+#
+#   CUDA_VISIBLE_DEVICES=1 python tools/train_student.py configs/phase2_mid_fused_stage2_convbn.yaml \
+#     --teacher-ckpt /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth \
+#     --stage 2 --student-ckpt .../students/midf_b0.01_convbn_s1.pth \
+#     --out .../students/midf_b0.01_convbn_s2.pth
+_base_: phase2_mid_fused_stage2.yaml
+
+bottleneck:
+  args:
+    act: convbn

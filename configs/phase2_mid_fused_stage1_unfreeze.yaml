@@ -1,0 +1,15 @@
+# Phase-2 MID fused, Stage 1 with UNFROZEN sender (workflow §9.5).
+#
+# Same cut / fused bottleneck / schedule as phase2_mid_fused_stage1.yaml; Stage 1 trains
+# sender encoder (stem..stage3) + bottleneck end-to-end. Distillation targets come from
+# a frozen init-time sender snapshot (_sender_ref), not the drifting live encoder.
+#
+#   CUDA_VISIBLE_DEVICES=<idx> python tools/train_student.py configs/phase2_mid_fused_stage1_unfreeze.yaml \
+#     --teacher-ckpt /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth \
+#     --beta 0.01 --out /data/sidney/checkpoints/semantic-sensing/students/midf_u_b0.01_s1.pth \
+#     2>&1 | tee /data/sidney/checkpoints/semantic-sensing/students/_orch/midf_u_b0.01_s1.log
+_base_: phase2_mid_fused_stage1.yaml
+
+student:
+  unfreeze_sender: true
+  sender_lr: 1.0e-4              # below codec lr (1e-3); trainer uses separate param groups

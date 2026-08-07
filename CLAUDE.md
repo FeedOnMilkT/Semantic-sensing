@@ -13,6 +13,11 @@
 - **数据集主用 ADE20K**（150 类单任务 seg）；Cityscapes 降为跨数据集对照。
 - **先只做单任务分割（seg）**；多任务（depth/normal，原 Phase 1b）暂缓——但**框架的多任务可扩展性
   保持不动**（`heads` 是 dict、`bottleneck` 空槽、4-scale 接口都在）。
+- **当前语义验收只以固定 19 类大目标 macro IoU 为主指标**：类别 index
+  `[7,10,15,20,23,30,35,37,48,51,80,83,84,90,101,102,103,109,122]`。全 ADE20K
+  150 类 mIoU、per-class IoU、pixel accuracy、loss 仍须报告，但只作副指标。当前
+  `gfa-gs-v1` 的 Hailo PTQ 门槛是相对 candidate FP `0.3849525787712008` 下降不超过
+  `2.0 pp`，即 QUANTIZED large-object macro IoU `>=0.3649525787712008`。
 - **Phase 2 蒸馏的冻结 teacher 暂用单任务 seg teacher**（选项 A）。
 - **TopFormer 暂搁置**：作 split-computing 时 split-point 不好选（SSE/SIM 是并联旁路+回灌，缺
   RTFormer stage3 那种 conv→attention 串联分界与单张紧致 cut）。
@@ -38,16 +43,21 @@
   条件修订为"仅对 rate 侧有结构性冗余的 bottleneck 有效"（distill 上 +0.70 点仍成立）。
   两轮评测统一在 `notes/phase2_eval_2026-07-05_fused_taskweight.md`（第二轮章节含支配关系
   判定与 BD 数字）；曲线 `_orch/report_s2_fullval_v3.{csv,png}`（v2 保留）。
-- 下一步（候选，均待定未开跑）：fused β=0.001 探高码率端、β=0.003 修复后代码重跑对齐、
-  Cityscapes 跨数据集、Hailo `act: convbn` 导出，见 07-05 笔记末尾"后续候选"。
-
-- **Phase 2.5 立项（2026-07-06）**：Phase 2 已 commit 闭环；下一阶段四臂并行计划已立项，写入
-  workflow **§9**——A 臂 Stage 2 细化（teacher logit 蒸馏 + 训练预算，攻遗留 teacher ceiling
-  0.3655 − 平台 0.3534 ≈ 1.2 点 gap，已证非码率问题）、B 臂 Hailo 部署验证（convbn 档重训 +
-  sender 子图 ONNX → DFC → 器件延迟）、C 臂 β=0.001 高码率端补点、D 臂实时性评测
-  （latency/throughput 表，新工具 `tools/bench_latency.py` 计划中未写）。均**待跑**。
-  **下一步 = 开跑 A/C/D 臂**（A×3 + C×1 训练卡并行，D 用空卡/间隙测，B 排空卡后）；决策项
-  （解冻 sender）仅当 A 咬不进 1.0 点时启动。详见 workflow §9。
+- **Phase 2.5 收尾（2026-07-06）**：A/C/D 三臂评测完成，全 val v4 重评 22 点
+  （`_orch/report_s2_fullval_v4.{csv,png,log}`）。**C 臂 β=0.001 平台确认**（0.6351/0.3523，
+  高码率未爬升）。**A 臂 KD 负结果确认**（w_kd 0.5→1.0 单调恶化，mIoU 0.307→0.245，
+  较基线 0.3534 低 4.6~10.9 点）→ KD 消融关闭。**§9.5 解冻 sender**
+  Stage 1 完成（`midf_u_b0.01_s1`：0.2906/0.3366），Stage 2 训练中。
+  BD-rate 四 β 点 vs JPEG 仍 **−69.2%**。详见 eval 笔记第三轮章节 + workflow §9.8。
+- **§9.5 解冻 sender Stage 2 训练中**（2026-07-07：`midf_u_b0.01_s2`，GPU0，
+  `phase2_mid_fused_stage2_unfreeze.yaml`，20ep/101k steps，log `_orch/midf_u_b0.01_s2.log`）。
+- B 臂 Hailo(2026-07-08):GDN 版 9 模块 ONNX + manifest 已导(`export_modules_fused.py`);
+  离线预判 GDN codec 过不了 parse → 待 host Hailo 容器真跑;convbn 训练仍排后。
+  **部署根目录统一 = `/workspace/demo/deplyment-demo`**(fused profile 挂靠其 `hailo_deploy`
+  pipeline:`config_fused.py` + `scripts/run_fused_*.py` + `FUSED_DEPLOYMENT.md`);
+  ONNX 导出仍在本侧 sidney-dev 跑。
+- 下一步（优先级）：§9.5 Stage 2 跑完 → full-val 对比 frozen `midf_b0.01_s2`
+  （0.2852/0.3534）；B 臂 convbn 训练；β=0.003 修复后重跑；Cityscapes 跨数据集。
 
 ---
 
@@ -112,7 +122,9 @@ semantic-sensing/
     _legacy/   多任务/depth/segformer-teacher 等暂缓实验（自洽，含一份 base.yaml）
   tools/   train.py  eval.py  smoke_test.py  pretrain_imagenet.py  export_onnx.py  export_modules*.py  _common.py
   notes/   研究记录（方向决策、各 ablation 笔记）
-  deploy/  hailo/parse_modules.py（Hailo DFC parse 脚本；ONNX 产物不入库，用 export_modules 现导）
+  deploy/  hailo/{README_fused_modules（指针）,README_fused_sender,fused_sender.alls}
+           ← 部署统一在 /workspace/demo/deplyment-demo（FUSED_DEPLOYMENT.md + hailo_deploy/config_fused.py）；
+             本侧只留 ONNX 导出 tools/export_modules_fused.py（→/data/sidney/.../hailo/onnx/modules/）
 ```
 
 ## 模型 / 落盘（重要：遵守容器磁盘纪律）

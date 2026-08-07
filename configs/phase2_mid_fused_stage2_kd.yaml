@@ -1,0 +1,20 @@
+# Phase-2.5 A-arm (fused workflow §9.1): Stage 2 + teacher logit distillation (KD).
+# Attacks the ~1.2-point gap to the teacher ceiling (0.3655 vs fused plateau 0.3534):
+# on top of CE+Dice, the receiver tail also matches the frozen teacher's soft output
+# on the CLEAN image — L += w_kd * T^2 * KL(softmax(teacher/T) ‖ softmax(student/T)).
+# Budget also widened per §9.1 A2: stage2 epochs 20 -> 40 (lr sweep via --lr).
+#
+#   CUDA_VISIBLE_DEVICES=1 python tools/train_student.py configs/phase2_mid_fused_stage2_kd.yaml \
+#     --teacher-ckpt /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth \
+#     --stage 2 \
+#     --student-ckpt /data/sidney/checkpoints/semantic-sensing/students/midf_b0.01_s1.pth \
+#     --out /data/sidney/checkpoints/semantic-sensing/students/midf_b0.01_kd0.5_s2.pth
+#
+# ckpt naming: midf_b0.01_kd<w>_s2.pth (append _lr<lr> when sweeping lr off-default).
+_base_: phase2_mid_fused_stage2.yaml
+
+stage2:
+  epochs: 40                   # §9.1 A2: doubled tail fine-tune budget
+  kd:
+    weight: 0.5                # §9.1 starting point (CE-comparable scale; drop to 0.25 if it fights Dice)
+    temperature: 4.0

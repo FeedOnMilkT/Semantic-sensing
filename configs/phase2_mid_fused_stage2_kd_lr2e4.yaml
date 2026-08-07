@@ -1,0 +1,13 @@
+# Phase-2.5 A-arm KD sweep: lr=2e-4 (vs default 1e-4); w_kd=0.5 unchanged.
+# Stage 2 only; note --lr CLI is ignored when stage2.optimizer block exists — override here.
+#
+#   CUDA_VISIBLE_DEVICES=5 python tools/train_student.py configs/phase2_mid_fused_stage2_kd_lr2e4.yaml \
+#     --teacher-ckpt /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth \
+#     --stage 2 \
+#     --student-ckpt /data/sidney/checkpoints/semantic-sensing/students/midf_b0.01_s1.pth \
+#     --out /data/sidney/checkpoints/semantic-sensing/students/midf_b0.01_kd0.5_lr2e-4_s2.pth
+_base_: phase2_mid_fused_stage2_kd.yaml
+
+stage2:
+  optimizer:
+    lr: 2.0e-4

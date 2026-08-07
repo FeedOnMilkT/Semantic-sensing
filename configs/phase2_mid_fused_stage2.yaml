@@ -21,3 +21,6 @@ stage2:
   scheduler: poly
   warmup: 0
   grad_clip: 1.0
+  kd:                          # teacher logit distillation (Phase-2.5 A-arm, workflow §9.1)
+    weight: 0.0                # 0 = off (exact pre-KD behaviour, no extra teacher forward)
+    temperature: 4.0           # softmax temperature T; loss = w * T^2 * KL(teacher ‖ student)

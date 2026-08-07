@@ -14,9 +14,12 @@ NOTE: forward/backward run on GPU fine; the rANS coder (compress/decompress) is 
 and is exercised by tools/smoke_student_split.py, not here (this tool uses estimated bpp).
 """
 import argparse
+import copy
 import os
+import random
 
 from _common import make_loader, pick_device
+import numpy as np
 from omegaconf import OmegaConf
 import torch
 from torch.utils.data import DataLoader
@@ -40,6 +43,8 @@ def main():
                     help="1 = train bottleneck (feature-MSE + beta*rate); 2 = freeze bottleneck, "
                          "fine-tune receiver tail (CE+Dice)")
     ap.add_argument("--student-ckpt", default=None, help="Stage-1 student .pth to load before Stage 2")
+    ap.add_argument("--reference-student-ckpt", default=None,
+                    help="frozen original-receiver checkpoint for controlled reference KD")
     ap.add_argument("--beta", type=float, default=0.01, help="rate weight (sweep this for the curve)")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--aux-lr", type=float, default=1e-3)
@@ -51,9 +56,18 @@ def main():
     ap.add_argument("--batch-size", type=int, default=None, help="override per-step batch size")
     ap.add_argument("--val-limit", type=int, default=None, help="eval on first N val images (sanity speed)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--seed", type=int, default=20260717,
+                    help="random seed for Python, NumPy, PyTorch, and DataLoader shuffling")
     ap.add_argument("--smoke", action="store_true", help="synthetic data + random teacher (wiring check)")
     ap.add_argument("--no-eval", action="store_true")
     args = ap.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    log.info(f"seed={args.seed}")
 
     device = "cpu" if args.smoke else pick_device()
     cfg = load_config(args.config)
@@ -74,8 +88,11 @@ def main():
         student.load_state_dict(sd["student"])
         log.info(f"loaded student {args.student_ckpt}")
     n_codec = sum(p.numel() for p in student.codec_parameters()) / 1e6
+    unfreeze = bool(cfg.student.get("unfreeze_sender", False))
+    n_sender = sum(p.numel() for p in student.sender_parameters()) / 1e6 if unfreeze else 0.0
     log.info(f"split={cfg.student.split} stage={args.stage} bottleneck={cfg.bottleneck.name} "
-             f"in_ch={student.bottleneck.in_channels} codec_params={n_codec:.2f}M device={device}")
+             f"in_ch={student.bottleneck.in_channels} codec_params={n_codec:.2f}M "
+             f"unfreeze_sender={unfreeze} sender_params={n_sender:.2f}M device={device}")
 
     # ---- data ----
     if args.smoke:
@@ -113,7 +130,28 @@ def main():
         s2cfg.setdefault("ignore_index", ignore_index)
         if "optimizer" not in s2cfg:
             s2cfg.optimizer = {"lr": args.lr, "weight_decay": 0.01}
-        trainer = Stage2Trainer(s2cfg, student, device=device)
+        reference_student = None
+        reference_kd = s2cfg.get("reference_kd", None) or {}
+        if float(reference_kd.get("weight", 0.0)) > 0:
+            if not args.reference_student_ckpt:
+                raise ValueError("reference_kd requires --reference-student-ckpt")
+            if cfg.student.split != "mid":
+                raise ValueError("controlled reference_kd is only implemented for the mid split")
+            reference_student = copy.deepcopy(student)
+            reference_state = torch.load(
+                args.reference_student_ckpt, map_location="cpu", weights_only=False)
+            reference_student.load_state_dict(reference_state["student"], strict=True)
+            reference_student.teacher.backbone.stage4.gfa.mode = "original"
+            reference_student.teacher.backbone.stage5.gfa.mode = "original"
+            reference_student.eval()
+            for param in reference_student.parameters():
+                param.requires_grad_(False)
+            log.info("reference KD: original receiver, frozen/eval, same reconstruction; "
+                     f"weight={float(reference_kd.weight):g} "
+                     f"temperature={float(reference_kd.temperature):g} "
+                     f"ckpt={args.reference_student_ckpt}")
+        trainer = Stage2Trainer(
+            s2cfg, student, device=device, reference_student=reference_student)
         trainer.fit(train_loader, epochs=epochs, max_steps=args.max_steps,
                     log_every=cfg.train.get("log_every", 20))
     else:
@@ -121,6 +159,8 @@ def main():
             "optimizer": {"lr": args.lr, "weight_decay": 0.0}, "aux_lr": args.aux_lr,
             "scheduler": "poly", "warmup": 0, "grad_clip": 1.0,
             "task_weight": args.task_weight, "ignore_index": ignore_index,
+            "unfreeze_sender": unfreeze,
+            "sender_lr": float(cfg.student.get("sender_lr", 1e-4)),
         })
         trainer = StudentTrainer(tcfg, student, beta=args.beta, device=device)
         trainer.fit(train_loader, epochs=epochs, max_steps=args.max_steps,

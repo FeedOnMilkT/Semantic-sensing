@@ -28,7 +28,10 @@ forward(x) -> {"preds","target","recon","info"[, "target_aux","recon_aux"]}:
                  (x_h, x_l) tuples; the trainer's feature_mse sums over branches.
   info         : rate info; info["likelihoods"] sums ALL transmitted tensors.
 """
+import copy
+
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .bottlenecks import build_bottleneck
 
@@ -45,13 +48,17 @@ _SENDER_BB = {
 
 
 class SplitStudent(nn.Module):
-    def __init__(self, teacher, bottleneck, split, s4_bottleneck=None):
+    def __init__(self, teacher, bottleneck, split, s4_bottleneck=None, unfreeze_sender=False):
         super().__init__()
         assert split in ("early", "mid", "late", "neck"), f"unknown split '{split}'"
         self.split = split
         self.teacher = teacher
         self.bottleneck = bottleneck
         self.s4_bottleneck = s4_bottleneck          # early + compress_s4: compresses the s4 bypass
+        self.unfreeze_sender = unfreeze_sender
+        self._sender_ref = None                       # frozen teacher snapshot for distillation targets
+        if unfreeze_sender:
+            self._build_sender_ref()
         self._freeze_teacher()
 
     def _freeze_teacher(self):
@@ -59,9 +66,29 @@ class SplitStudent(nn.Module):
         for p in self.teacher.parameters():
             p.requires_grad_(False)
 
+    def _build_sender_ref(self):
+        """Shallow-copy the sender backbone submodules at init; frozen forever so Stage-1
+        feature-MSE targets stay anchored to the original teacher even as the live sender
+        drifts (Entropic-Student-style unfreeze without a moving target)."""
+        bb = self.teacher.backbone
+        names = _SENDER_BB.get(self.split, ())
+        ref = nn.ModuleDict({n: copy.deepcopy(getattr(bb, n)) for n in names})
+        ref.eval()
+        for p in ref.parameters():
+            p.requires_grad_(False)
+        self._sender_ref = ref
+
     def train(self, mode=True):
         super().train(mode)
-        self.teacher.eval()                          # Stage 1: only the bottleneck trains
+        if not self.unfreeze_sender:
+            self.teacher.eval()                      # Stage 1 default: only bottleneck trains
+            return self
+        for m in self.receiver_modules():
+            m.eval()                                 # receiver tail stays frozen BN stats
+        for m in self.sender_modules():
+            m.train(mode)
+        for bn in self._bns():
+            bn.train(mode)
         return self
 
     # ---- split routing ----
@@ -75,6 +102,33 @@ class SplitStudent(nn.Module):
         if self.split == "mid":
             return bb.forward_sender_mid(x), {}      # (x_h, x_l)
         return bb.forward_sender_late(x), {}         # late: (x_h, x_l)
+
+    def _sender_ref_forward(self, x):
+        """Frozen teacher sender path (uses self._sender_ref, never the trainable copy)."""
+        ref = self._sender_ref
+        if self.split == "neck":
+            return self.teacher.neck(self.teacher.backbone(x))
+        s4 = ref["stage1"](ref["stem"](x))
+        high = ref["stage2"](s4)
+        if self.split == "early":
+            return high
+        h3 = ref["s3_high"](high)
+        l3 = ref["s3_low"](high)
+        x_h = F.relu(h3 + F.interpolate(ref["s3_l2h"](l3), size=h3.shape[-2:],
+                                        mode="bilinear", align_corners=False), inplace=True)
+        x_l = F.relu(l3 + ref["s3_h2l"](h3), inplace=True)
+        if self.split == "mid":
+            return x_h, x_l
+        high, low = ref["stage4"](x_h, x_l)
+        return ref["stage5"](high, low)
+
+    def _teacher_split_target(self, x):
+        """Distillation target at the split. When the live sender is trainable, targets
+        must NOT come from it — use the frozen init-time reference instead."""
+        if self.unfreeze_sender:
+            return self._sender_ref_forward(x)
+        feat, _ = self._sender(x)
+        return feat
 
     def _receiver(self, feat, ctx):
         t = self.teacher
@@ -94,7 +148,7 @@ class SplitStudent(nn.Module):
     def forward(self, x, tasks=None):
         split_feat, ctx = self._sender(x)
         recon, info = self.bottleneck(split_feat)
-        out = {"target": split_feat, "recon": recon}
+        out = {"target": self._teacher_split_target(x), "recon": recon}
         if self.s4_bottleneck is not None and self.split == "early":
             s4_hat, info_s4 = self.s4_bottleneck(ctx["s4"])
             out["target_aux"], out["recon_aux"] = ctx["s4"], s4_hat
@@ -137,6 +191,41 @@ class SplitStudent(nn.Module):
 
     def update(self, force=True):
         return all(bn.update(force=force) for bn in self._bns())
+
+    # ---- Stage 1 sender (optional unfreeze, workflow §9.5) ----
+    def sender_modules(self):
+        """Teacher modules on the SEND side of the cut (= the encoder Stage 1 may unfreeze)."""
+        if self.split == "neck":
+            return [self.teacher.backbone, self.teacher.neck]
+        return [getattr(self.teacher.backbone, n) for n in _SENDER_BB[self.split]]
+
+    def sender_parameters(self):
+        seen, out = set(), []
+        for m in self.sender_modules():
+            for p in m.parameters():
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    out.append(p)
+        return out
+
+    def stage1_trainable_parameters(self):
+        params = list(self.codec_parameters())
+        if self.unfreeze_sender:
+            params.extend(self.sender_parameters())
+        return params
+
+    def set_stage1_trainable(self, unfreeze_sender=None):
+        """Stage 1: train bottleneck (+ optional sender); receiver tail stays frozen."""
+        if unfreeze_sender is not None:
+            self.unfreeze_sender = unfreeze_sender
+        for p in self.teacher.parameters():
+            p.requires_grad_(False)
+        for bn in self._bns():
+            for p in bn.parameters():
+                p.requires_grad_(True)
+        if self.unfreeze_sender:
+            for p in self.sender_parameters():
+                p.requires_grad_(True)
 
     # ---- Stage 2: fine-tune the receiver tail (spec §5.2) ----
     def receiver_modules(self):
@@ -188,9 +277,13 @@ def split_in_channels(teacher, split):
 
 def build_student(cfg, teacher):
     split = cfg.student.split
+    unfreeze_sender = bool(cfg.student.get("unfreeze_sender", False))
     bottleneck = build_bottleneck(cfg.bottleneck, in_channels=split_in_channels(teacher, split))
     s4_bottleneck = None
     if split == "early" and cfg.student.get("compress_s4", False):
         # same bottleneck recipe, sized for the s4 scale (c1 channels, 1/4 res)
         s4_bottleneck = build_bottleneck(cfg.bottleneck, in_channels=teacher.backbone.out_channels["s4"])
-    return SplitStudent(teacher, bottleneck, split=split, s4_bottleneck=s4_bottleneck)
+    student = SplitStudent(teacher, bottleneck, split=split, s4_bottleneck=s4_bottleneck,
+                           unfreeze_sender=unfreeze_sender)
+    student.set_stage1_trainable(unfreeze_sender)
+    return student

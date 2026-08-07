@@ -12,6 +12,15 @@ Adding a bottleneck = one builder fn + one dict entry (grep-able, no magic). The
 """
 import torch.nn as nn
 
+def _ensure_fast_rans():
+    """Apply buffer rANS patch once CompressAI is about to be used."""
+    try:
+        from ...codec.patch_compressai import apply
+        apply()
+    except Exception:
+        pass
+
+
 
 class Identity(nn.Module):
     """No-op slot: returns the feature unchanged + None info, matching the tuple
@@ -29,6 +38,7 @@ def _build_identity(cfg, in_channels):
 
 
 def _build_compression(cfg, in_channels):
+    _ensure_fast_rans()
     from .compression import CommBottleneck   # lazy: imports CompressAI only on demand
     if in_channels is None:
         raise ValueError("compression bottleneck needs in_channels (split feature channels)")
@@ -36,6 +46,7 @@ def _build_compression(cfg, in_channels):
 
 
 def _build_hyperprior(cfg, in_channels):
+    _ensure_fast_rans()
     from .hyperprior import HyperpriorBottleneck   # lazy: imports CompressAI only on demand
     if in_channels is None:
         raise ValueError("hyperprior bottleneck needs in_channels (split feature channels)")
@@ -43,6 +54,7 @@ def _build_hyperprior(cfg, in_channels):
 
 
 def _build_rtformer_distill(cfg, in_channels):
+    _ensure_fast_rans()
     """Dual-latent / single-container bottleneck (phase2 MID/LATE main line).
     `in_channels` must be a (c_high, c_low) tuple (set by build_student from the
     split's two-branch channels)."""
@@ -54,6 +66,7 @@ def _build_rtformer_distill(cfg, in_channels):
 
 
 def _build_rtformer_fused(cfg, in_channels):
+    _ensure_fast_rans()
     """Fused single-latent bottleneck (L-MSFC-style joint coding of the dual payload).
     `in_channels` must be a (c_high, c_low) tuple, same as rtformer_distill."""
     from .rtformer_fused import FusedLatentBottleneck   # lazy: imports CompressAI on demand

@@ -1,0 +1,13 @@
+# Phase-2 MID fused UNFREEZE path, Stage 2 (receiver tail fine-tune).
+# Same recipe as phase2_mid_fused_stage2.yaml; unfreeze_sender=True is required so
+# _sender_ref keys from the Stage-1 unfreeze ckpt load cleanly (Stage 2 freezes
+# sender+bottleneck anyway — _sender_ref is inert at inference).
+#
+#   CUDA_VISIBLE_DEVICES=<idx> python tools/train_student.py configs/phase2_mid_fused_stage2_unfreeze.yaml \
+#     --teacher-ckpt .../ade20k_rtformer_paperhead.pth --stage 2 \
+#     --student-ckpt .../students/midf_u_b0.01_s1.pth \
+#     --out .../students/midf_u_b0.01_s2.pth
+_base_: phase2_mid_fused_stage2.yaml
+
+student:
+  unfreeze_sender: true

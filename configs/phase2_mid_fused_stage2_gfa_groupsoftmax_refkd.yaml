@@ -1,0 +1,9 @@
+# Single controlled recovery attempt after the plain group_softmax G3 miss.
+_base_: phase2_mid_fused_stage2_gfa_groupsoftmax.yaml
+
+stage2:
+  kd:
+    weight: 0.0
+  reference_kd:
+    weight: 0.05
+    temperature: 4.0

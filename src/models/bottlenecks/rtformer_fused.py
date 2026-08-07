@@ -30,6 +30,11 @@ Kept as the capacity upgrade for workflow §7 risk 2 (joint g_a underfitting).
 import struct
 
 from ... import _compat  # noqa: F401  applies the add_safe_globals shim before CompressAI
+try:
+    from ...codec.patch_compressai import apply as _apply_fast_rans
+    _apply_fast_rans()
+except Exception:
+    pass
 
 import torch
 import torch.nn as nn

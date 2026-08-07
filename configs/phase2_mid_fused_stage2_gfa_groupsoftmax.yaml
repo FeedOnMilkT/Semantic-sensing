@@ -1,0 +1,14 @@
+# Phase-2 MID fused receiver adaptation after the Hailo GFA feasibility gate.
+# The default RTFormer behaviour remains ``gfa_mode: original`` in all existing configs.
+_base_: phase2_mid_fused_stage2.yaml
+
+model:
+  backbone:
+    args:
+      gfa_mode: group_softmax
+
+stage2:
+  # Existing KD uses the mutable student teacher path and is not an original-receiver
+  # reference after the GFA architecture changes. Keep it off for the first recovery run.
+  kd:
+    weight: 0.0

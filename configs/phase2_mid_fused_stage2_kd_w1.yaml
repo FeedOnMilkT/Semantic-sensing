@@ -1,0 +1,13 @@
+# Phase-2.5 A-arm KD sweep: w_kd=1.0 (vs default 0.5 in phase2_mid_fused_stage2_kd.yaml).
+# Stage 2 only; all other hyperparams (epochs=40, T=4, lr=1e-4) inherited from base.
+#
+#   CUDA_VISIBLE_DEVICES=4 python tools/train_student.py configs/phase2_mid_fused_stage2_kd_w1.yaml \
+#     --teacher-ckpt /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth \
+#     --stage 2 \
+#     --student-ckpt /data/sidney/checkpoints/semantic-sensing/students/midf_b0.01_s1.pth \
+#     --out /data/sidney/checkpoints/semantic-sensing/students/midf_b0.01_kd1.0_s2.pth
+_base_: phase2_mid_fused_stage2_kd.yaml
+
+stage2:
+  kd:
+    weight: 1.0

@@ -21,7 +21,7 @@ wandb/
 
 # others
 # *.sh
-*.md
+# Markdown docs (AGENTS/README/notes/codec README) are tracked — do NOT ignore *.md
 *.txt
 *.json
 # *.yaml
@@ -31,3 +31,19 @@ wandb/
 *.xls
 *.xlsx
 *.xlsm
+# rans_fast native extension (build per host/arch)
+src/codec/rans_fast/_rans_fast*.so
+src/codec/rans_fast/build/
+
+*.alls
+*.har
+*.hef
+*.npy
+*.npz
+*.onnx
+*.pth
+*.pt
+*.hdf5
+
+*.zip
+*.md

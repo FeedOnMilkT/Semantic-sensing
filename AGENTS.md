@@ -56,3 +56,36 @@ Follow `/workspace/CLAUDE.md` and `semantic-sensing/CLAUDE.md` before substantia
 ## Commit & Pull Request Guidelines
 
 Use short, specific commit subjects such as `Add mid split dual-latent bottleneck` or `Wire rate into student training`. PRs should list changed configs/code paths, commands run, teacher checkpoint used, and any `[POINT] bpp/mIoU` results.
+
+## Raspberry Pi SSH (Tailscale userspace)
+
+The board is **not** reachable by plain `ssh sidney@100.81.213.24` from this container.
+Agents must use the userspace Tailscale under `/workspace/.tailscale`:
+
+- socket: `/workspace/.tailscale/tailscaled.sock`
+- SOCKS5: `127.0.0.1:1055` (`--tun=userspace-networking --socks5-server=...`)
+- deploy key: `/workspace/.tailscale/siriberry_deploy_ed25519`
+- known_hosts: `/workspace/.tailscale/siriberry_known_hosts`
+
+```bash
+# Ensure daemon (idempotent)
+mkdir -p /workspace/.tailscale
+if ! pgrep -x tailscaled >/dev/null; then
+  nohup sudo /usr/sbin/tailscaled \
+    --state=/workspace/.tailscale/tailscaled.state \
+    --socket=/workspace/.tailscale/tailscaled.sock \
+    --tun=userspace-networking \
+    --socks5-server=127.0.0.1:1055 \
+    >/workspace/.tailscale/tailscaled.log 2>&1 &
+fi
+
+ssh -i /workspace/.tailscale/siriberry_deploy_ed25519 -o IdentitiesOnly=yes \
+  -o 'ProxyCommand=nc -X 5 -x 127.0.0.1:1055 %h %p' \
+  -o BatchMode=yes -o ConnectTimeout=25 \
+  -o StrictHostKeyChecking=accept-new \
+  -o UserKnownHostsFile=/workspace/.tailscale/siriberry_known_hosts \
+  sidney@siriberry.tailae65a5.ts.net
+# or: sidney@100.81.213.24
+```
+
+Do **not** rely on `siriberry.local` (LAN mDNS) or MagicDNS without the SOCKS proxy from this host.

@@ -1,0 +1,18 @@
+# Phase-2 MID fused Stage 2 — Hailo-foldable ConvBN bottleneck + group_softmax GFA.
+# Warm-start from midf_*_convbn_s1.pth. Freezes sender + bottleneck; trains receiver tail.
+#
+#   CUDA_VISIBLE_DEVICES=0 python tools/train_student.py \
+#     configs/phase2_mid_fused_stage2_convbn_gfa_groupsoftmax.yaml --stage 2 \
+#     --teacher-ckpt /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth \
+#     --student-ckpt /data/sidney/checkpoints/semantic-sensing/students/midf_b0.01_convbn_s1.pth \
+#     --out /data/sidney/checkpoints/semantic-sensing/students/midf_b0.01_convbn_s2_gfa-gs-v1.pth
+_base_: phase2_mid_fused_stage2_convbn.yaml
+
+model:
+  backbone:
+    args:
+      gfa_mode: group_softmax
+
+stage2:
+  kd:
+    weight: 0.0

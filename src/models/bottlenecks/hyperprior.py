@@ -22,6 +22,11 @@ y and z likelihoods. compress/decompress give the real two-stream bitstream.
 import math
 
 from ... import _compat  # noqa: F401  applies the add_safe_globals shim before CompressAI
+try:
+    from ...codec.patch_compressai import apply as _apply_fast_rans
+    _apply_fast_rans()
+except Exception:
+    pass
 
 import torch
 import torch.nn as nn

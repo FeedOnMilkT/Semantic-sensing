@@ -27,6 +27,27 @@ from .trainer import poly_lr, _fmt_eta
 log = get_logger("student")
 
 
+def kd_loss(student_logits, teacher_logits, gt, temperature, ignore_index):
+    """Stage-2 logit distillation (Phase-2.5 A-arm, fused workflow §9.1): forward KL
+    with the Hinton T² scale, i.e. T²·KL(softmax(teacher/T) ‖ softmax(student/T)),
+    averaged over non-ignore pixels. Logits are aligned to the gt resolution the same
+    way SegLoss aligns for CE. All-ignore batches return a graph-connected zero (no
+    NaN from an empty mean). log_softmax keeps the KL numerically stable."""
+    if student_logits.shape[-2:] != gt.shape[-2:]:
+        student_logits = F.interpolate(student_logits, size=gt.shape[-2:],
+                                       mode="bilinear", align_corners=False)
+    if teacher_logits.shape[-2:] != gt.shape[-2:]:
+        teacher_logits = F.interpolate(teacher_logits, size=gt.shape[-2:],
+                                       mode="bilinear", align_corners=False)
+    valid = gt != ignore_index                              # (B, H, W)
+    if not valid.any():
+        return student_logits.sum() * 0.0
+    log_p_s = F.log_softmax(student_logits / temperature, dim=1)
+    log_p_t = F.log_softmax(teacher_logits / temperature, dim=1)
+    kl = (log_p_t.exp() * (log_p_t - log_p_s)).sum(dim=1)   # per-pixel KL(t ‖ s)
+    return (temperature ** 2) * kl[valid].mean()
+
+
 def _distortion(target, recon):
     """Feature-MSE distillation distortion. Sums over branches for the dual
     (mid/late) payload where target/recon are (x_h, x_l) tuples; single tensor
@@ -43,11 +64,16 @@ class StudentTrainer:
         self.beta = beta
         self.device = device
         opt = cfg.get("optimizer", {})
-        self.codec_opt = torch.optim.Adam(student.codec_parameters(),
-                                          lr=opt.get("lr", 1e-3),
-                                          weight_decay=opt.get("weight_decay", 0.0))
+        self.unfreeze_sender = bool(cfg.get("unfreeze_sender", False))
+        codec_lr = opt.get("lr", 1e-3)
+        sender_lr = float(cfg.get("sender_lr", 1e-4))
+        groups = [{"params": student.codec_parameters(), "lr": codec_lr}]
+        self.group_base_lrs = [codec_lr]
+        if self.unfreeze_sender:
+            groups.append({"params": student.sender_parameters(), "lr": sender_lr})
+            self.group_base_lrs.append(sender_lr)
+        self.codec_opt = torch.optim.Adam(groups, weight_decay=opt.get("weight_decay", 0.0))
         self.aux_opt = torch.optim.Adam(student.aux_parameters(), lr=cfg.get("aux_lr", 1e-3))
-        self.base_lr = self.codec_opt.param_groups[0]["lr"]
         self.sched = cfg.get("scheduler", "poly")
         self.warmup = cfg.get("warmup", 0)
         self.grad_clip = cfg.get("grad_clip", 0.0)
@@ -55,10 +81,12 @@ class StudentTrainer:
         self.ignore_index = cfg.get("ignore_index", 255)
 
     def _set_lr(self, step, total):
-        lr = poly_lr(step, total, self.base_lr, warmup=self.warmup) if self.sched == "poly" else self.base_lr
-        for g in self.codec_opt.param_groups:
+        lrs = []
+        for base, g in zip(self.group_base_lrs, self.codec_opt.param_groups):
+            lr = poly_lr(step, total, base, warmup=self.warmup) if self.sched == "poly" else base
             g["lr"] = lr
-        return lr
+            lrs.append(lr)
+        return lrs[0]
 
     def fit(self, loader, epochs=1, max_steps=None, log_every=20):
         spe = len(loader)
@@ -88,7 +116,8 @@ class StudentTrainer:
                 self.codec_opt.zero_grad(set_to_none=True)
                 loss.backward()
                 if self.grad_clip:
-                    torch.nn.utils.clip_grad_norm_(self.student.codec_parameters(), self.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(self.student.stage1_trainable_parameters(),
+                                                   self.grad_clip)
                 self.codec_opt.step()
 
                 aux = self.student.aux_loss()           # train the CDF quantiles separately
@@ -109,15 +138,19 @@ class StudentTrainer:
 
 class Stage2Trainer:
     """Stage 2 (spec §5.2): freeze the sender encoder + bottleneck (deployment side
-    fixed, entropy model locked), fine-tune the RECEIVER TAIL with the task loss
-    L = CE + Dice (+ Lovász switch). The student runs in eval() mode so the frozen
+    fixed, entropy model locked),     fine-tune the RECEIVER TAIL with the task loss
+    L = CE + Dice (+ Lovász switch) (+ optional teacher logit KD, Phase-2.5 A-arm
+    §9.1: cfg `kd: {weight, temperature}`; weight=0 (default) skips the extra
+    teacher forward entirely and is bit-identical to the plain path; weight>0 adds
+    `weight * kd_loss(...)` where teacher logits come from one extra no-grad full
+    teacher forward on the clean image per step). The student runs in eval() mode so the frozen
     bottleneck quantises like deployment (rounded latents) and tail BN stats stay
     fixed — only the tail conv/linear weights update.
 
     ignore_index / num_classes MUST match the teacher's ADE20K convention (spec §5.2)
     or mIoU is meaningless; both come from cfg."""
 
-    def __init__(self, cfg, student, device="cuda"):
+    def __init__(self, cfg, student, device="cuda", reference_student=None):
         self.cfg = cfg
         student.set_stage2_trainable()
         self.student = student.to(device)
@@ -136,12 +169,45 @@ class Stage2Trainer:
         self.sched = cfg.get("scheduler", "poly")
         self.warmup = cfg.get("warmup", 0)
         self.grad_clip = cfg.get("grad_clip", 1.0)
+        kd = cfg.get("kd", None) or {}
+        self.kd_weight = float(kd.get("weight", 0.0))
+        self.kd_temperature = float(kd.get("temperature", 4.0))
+        reference_kd = cfg.get("reference_kd", None) or {}
+        self.reference_kd_weight = float(reference_kd.get("weight", 0.0))
+        self.reference_kd_temperature = float(reference_kd.get("temperature", 4.0))
+        self.reference_student = reference_student
+        if self.reference_kd_weight > 0:
+            if reference_student is None:
+                raise ValueError("reference_kd.weight > 0 requires a frozen reference_student")
+            self.reference_student = reference_student.to(device).eval()
+            for param in self.reference_student.parameters():
+                param.requires_grad_(False)
 
     def _set_lr(self, step, total):
         lr = poly_lr(step, total, self.base_lr, warmup=self.warmup) if self.sched == "poly" else self.base_lr
         for g in self.opt.param_groups:
             g["lr"] = lr
         return lr
+
+    def _loss(self, x, gt):
+        """Total Stage-2 loss for one batch: CE+Dice(+Lovász), plus the optional KD
+        term. kd_weight == 0 takes the exact pre-KD path (no teacher forward)."""
+        out = self.student(x)                        # frozen bottleneck -> trainable tail -> preds
+        loss = self.loss_fn(out["preds"]["seg"], gt)
+        if self.kd_weight > 0:
+            with torch.no_grad():                    # clean teacher logits, one extra forward
+                teacher_logits = self.student.teacher(x)["seg"]
+            loss = loss + self.kd_weight * kd_loss(out["preds"]["seg"], teacher_logits,
+                                                   gt, self.kd_temperature, self.ignore_index)
+        if self.reference_kd_weight > 0:
+            with torch.no_grad():
+                # Both receivers consume the exact same codec reconstruction. For the
+                # active mid split no auxiliary sender context crosses the cut.
+                reference_logits = self.reference_student._receiver(out["recon"], {})["seg"]
+            loss = loss + self.reference_kd_weight * kd_loss(
+                out["preds"]["seg"], reference_logits, gt,
+                self.reference_kd_temperature, self.ignore_index)
+        return loss
 
     def fit(self, loader, epochs=1, max_steps=None, log_every=20):
         spe = len(loader)
@@ -155,8 +221,7 @@ class Stage2Trainer:
                 lr = self._set_lr(step, total)
                 x = batch["image"].to(self.device, non_blocking=True)
                 gt = batch["targets"]["seg"].to(self.device)
-                out = self.student(x)                # frozen bottleneck -> trainable tail -> preds
-                loss = self.loss_fn(out["preds"]["seg"], gt)
+                loss = self._loss(x, gt)
 
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()

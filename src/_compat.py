@@ -22,3 +22,12 @@ if not hasattr(_s, "add_safe_globals"):
 _THREADS = int(os.environ.get("SEMSENSE_NUM_THREADS", "8"))
 torch.set_num_threads(_THREADS)
 os.environ.setdefault("OMP_NUM_THREADS", str(_THREADS))
+
+# Patch CompressAI EntropyModel.compress/decompress to the fast buffer rANS path
+# (latent→bitstream only). Soft-fail if compressai is not installed yet.
+try:
+    from .codec.patch_compressai import apply as _apply_fast_rans
+
+    _apply_fast_rans()
+except Exception:
+    pass

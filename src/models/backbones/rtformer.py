@@ -64,11 +64,14 @@ class GFA(nn.Module):
     Single-head, learnable external memory Kg,Vg in R^(Mg x d), Mg = M*H.
     Grouped Double Normalization: softmax over the N tokens, then L1 over memory
     split into H groups. Linear in N (no multi-head matmul split). Residual."""
-    def __init__(self, dim, mem=128, groups=8):
+    def __init__(self, dim, mem=128, groups=8, mode="original"):
         super().__init__()
         assert mem % groups == 0, "mem (Mg) must divide groups (H)"
+        if mode not in {"original", "group_softmax", "memory_softmax"}:
+            raise ValueError(f"unknown GFA mode: {mode!r}")
         self.dim, self.mem, self.groups = dim, mem, groups
         self.per = mem // groups                       # M per group
+        self.mode = mode
         self.q = conv_bn(dim, dim, 1)                  # token projection
         self.kg = nn.Parameter(torch.randn(mem, dim) * dim ** -0.5)
         self.vg = nn.Parameter(torch.randn(mem, dim) * mem ** -0.5)
@@ -78,10 +81,19 @@ class GFA(nn.Module):
         B, C, H, W = x.shape
         n = self.q(x).flatten(2).transpose(1, 2)        # B,N,C
         attn = n @ self.kg.t()                          # B,N,Mg
-        attn = attn.softmax(dim=1)                       # 1st norm: softmax over tokens N
-        attn = attn.view(B, H * W, self.groups, self.per)
-        attn = attn / (attn.sum(dim=3, keepdim=True) + 1e-6)   # 2nd norm: grouped L1 over memory
-        attn = attn.view(B, H * W, self.mem)
+        if self.mode == "original":
+            attn = attn.softmax(dim=1)                   # 1st norm: softmax over tokens N
+            attn = attn.view(B, H * W, self.groups, self.per)
+            attn = attn / (attn.sum(dim=3, keepdim=True) + 1e-6)  # grouped L1
+            attn = attn.view(B, H * W, self.mem)
+        elif self.mode == "group_softmax":
+            # Hailo candidate: normalize the fixed 16-slot memory group directly.
+            # This removes the token-axis softmax and ReduceSum/Div chain while
+            # preserving q/kg/vg/proj parameters and the 8 x 16 memory layout.
+            attn = attn.view(B, H * W, self.groups, self.per).softmax(dim=-1)
+            attn = attn.view(B, H * W, self.mem)
+        else:  # memory_softmax: simpler fallback if group_softmax still fails DFC.
+            attn = attn.softmax(dim=-1)
         out = (attn @ self.vg).transpose(1, 2).reshape(B, C, H, W)
         return F.relu(x + self.proj(out), inplace=True)
 
@@ -119,11 +131,12 @@ class RTFormerStage(nn.Module):
     low: (optional strided-conv transition) + GFA + FFN ; high: stays 1/8,
     CrossResAttention(K/V from low) + FFN. stride=2 only at the stage4 transition
     (1/16->1/32); stage5 keeps 1/32 (stride=1, no channel change -> identity)."""
-    def __init__(self, c_high, c_low_in, c_low_out, stride, mem, groups, cross_size):
+    def __init__(self, c_high, c_low_in, c_low_out, stride, mem, groups, cross_size,
+                 gfa_mode="original"):
         super().__init__()
         self.low_trans = (conv_bn_relu(c_low_in, c_low_out, 3, stride)
                           if (stride != 1 or c_low_in != c_low_out) else nn.Identity())
-        self.gfa = GFA(c_low_out, mem=mem, groups=groups)
+        self.gfa = GFA(c_low_out, mem=mem, groups=groups, mode=gfa_mode)
         self.ffn_low = FFN(c_low_out)
         self.ca = CrossResAttention(c_high, c_low_out, cross_size=cross_size)
         self.ffn_high = FFN(c_high)
@@ -163,7 +176,8 @@ class DAPPM(nn.Module):
 
 
 class RTFormer(nn.Module):
-    def __init__(self, in_ch=3, channels=(64, 128, 256, 512), mem=128, groups=8, cross_size=12):
+    def __init__(self, in_ch=3, channels=(64, 128, 256, 512), mem=128, groups=8, cross_size=12,
+                 gfa_mode="original"):
         super().__init__()
         c1, c2, c3, c4 = channels        # stage1=64, stage2/high=128, low3=256, low45=512
         # stem -> 1/4, c1
@@ -178,8 +192,8 @@ class RTFormer(nn.Module):
         self.s3_h2l = conv_bn(c2, c3, 3, 2)                        # high->low (strided-add)
 
         # stage4 / stage5: RTFormer blocks (stepped). stage4 low 1/16->1/32; stage5 stays 1/32
-        self.stage4 = RTFormerStage(c2, c3, c4, 2, mem, groups, cross_size)   # low 256->512 @1/32
-        self.stage5 = RTFormerStage(c2, c4, c4, 1, mem, groups, cross_size)   # low 512->512 @1/32
+        self.stage4 = RTFormerStage(c2, c3, c4, 2, mem, groups, cross_size, gfa_mode)  # low 256->512 @1/32
+        self.stage5 = RTFormerStage(c2, c4, c4, 1, mem, groups, cross_size, gfa_mode)  # low 512->512 @1/32
 
         # seg-head context: DAPPM on low(1/32) -> fuse into high(1/8)
         self.dappm = DAPPM(c4, c4 // 4, c2)                        # cout=c2 to add to high

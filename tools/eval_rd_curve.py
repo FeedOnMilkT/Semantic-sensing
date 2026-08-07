@@ -35,6 +35,7 @@ _SERIES = [
     ("mid",          "mid_b*_{st}.pth",      "o-"),
     ("late",         "late_b*_{st}.pth",     "^:"),
     ("mid-fused",    "midf_b*_{st}.pth",     "D-"),   # rtformer_fused bottleneck (workflow §4)
+    ("mid-fused-kd", "midf_b*_kd*_{st}.pth", "x--"),  # Stage2 logit-KD ablation (workflow §9 A)
     ("mid-tw",       "mid_b*_tw*_{st}.pth",  "P-"),   # task-aware Stage 1 (workflow §5)
     ("mid-fused-tw", "midf_b*_tw*_{st}.pth", "v-"),   # combined arm (workflow §6 step 6)
 ]
@@ -78,8 +79,10 @@ def main():
     for label, pat, _mk in _SERIES:
         for st in stages:
             paths = sorted(glob.glob(os.path.join(args.students_dir, pat.format(st=st))))
-            if "tw" not in label:                 # plain globs also match *_tw* variants; keep those in the tw series
-                paths = [p for p in paths if "_tw" not in os.path.basename(p)]
+            if "tw" not in label and "kd" not in label:
+                # plain midf glob also matches *_tw* / *_kd*; route those to their series
+                paths = [p for p in paths if "_tw" not in os.path.basename(p)
+                         and "_kd" not in os.path.basename(p)]
             for ck in paths:
                 try:
                     _sp, beta, bpp, miou, pa = _eval_ckpt(ck, args.teacher_ckpt, args.val_limit, device)

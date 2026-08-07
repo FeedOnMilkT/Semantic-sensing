@@ -15,6 +15,11 @@ We do NOT use a pure-VIB rate: KL is a loose upper bound on bpp and emits no bit
 EntropyBottleneck is simultaneously the rate term and the actual coder.
 """
 from ... import _compat  # noqa: F401  applies the add_safe_globals shim before CompressAI
+try:
+    from ...codec.patch_compressai import apply as _apply_fast_rans
+    _apply_fast_rans()
+except Exception:
+    pass
 
 import torch
 import torch.nn as nn

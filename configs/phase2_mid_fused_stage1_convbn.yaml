@@ -1,0 +1,11 @@
+# Phase-2 MID fused bottleneck, Stage 1 — Hailo convbn variant (B-arm §9.2).
+# Same recipe as phase2_mid_fused_stage1.yaml; only act: gdn -> convbn for DFC foldability.
+#
+#   CUDA_VISIBLE_DEVICES=1 python tools/train_student.py configs/phase2_mid_fused_stage1_convbn.yaml \
+#     --teacher-ckpt /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth \
+#     --beta 0.01 --out /data/sidney/checkpoints/semantic-sensing/students/midf_b0.01_convbn_s1.pth
+_base_: phase2_mid_fused_stage1.yaml
+
+bottleneck:
+  args:
+    act: convbn
