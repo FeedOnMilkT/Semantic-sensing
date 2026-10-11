@@ -102,7 +102,7 @@ HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_
 
 该命令会按 HF dataset builder 下载/准备 train/validation 数据到 HF cache，检查标准 ImageNet-1K 的 train=1,281,167、validation=50,000、两 split 标签元数据各有 1000 类且 class names 完全相同；仅读取 Arrow 元数据，不遍历解码每一张图。若 HF 公开 builder 版本有差异，不能弱化为“非空即可”：先查清 split/config，明确报告实测长度和元数据差异，经用户确认数据仍为完整 ImageNet-1K 后再继续。此命令不建模、不训练、不写 checkpoint。若是 cache 残缺或下载中断，修复 cache/download 后复查；不要开始 dry-run 或 300-epoch 训练。
 
-### 4. 真实数据小批 dry-run
+### 4. 用真实数据完成预热与负载测量
 
 先执行正式入口的一次真实数据小批测试：
 
@@ -112,19 +112,21 @@ HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_
   --batch-size 2 --workers 0 --dry-run --out "$RUN_DIR/rtformer_in1k.pth"
 ```
 
-该模式要从真实 ImageNet 训练集和 validation 集各取一个 batch，执行训练 batch 的 forward、loss、backward、optimizer step，以及 validation batch forward；检查 loss/top-1 为有限值后退出，不写 checkpoint。若它失败，先解决授权、缓存、图像解码、label、CUDA/BF16 或显存问题；不得直接改成 FP32 或悄悄缩小正式 batch 后宣称 BF16 batch-128 已验证。
+当前仓库的 `--dry-run` 只跑一个训练 batch 和一个 validation batch，适合接线检查，不能证明稳态吞吐、DataLoader供给或worker内存表现。若它失败，先解决授权、缓存、图像解码、标签、CUDA/BF16 或显存问题；不得直接改成 FP32 或弱化增强、结构后宣称验证通过。
 
-batch 2 通过后再用正式 batch 做一次真实数据显存/吞吐小测，仍只执行一 train + 一 validation batch，不写checkpoint：
+正式运行前还必须用真实 ImageNet 数据作多步预热与负载测量，覆盖图像解码与增强、collate、双stage5分支模型、MixUp/CutMix soft-target loss、反传和optimizer update。validation继续用未经混合的整数标签。现有CLI若只有单batch dry-run，就用仓库外临时profile harness测多步，不给主训练源码增加未验证flag。至少warm up 20 steps，再测不少于50个train steps；另用真实validation数据跑评估batch。先以batch 2做接线检查，再profile默认batch 128。正式batch的计时应包含真实数据读取与增强。profile产生的optimizer update和模型状态仅用于负载测量，完成后丢弃；正式300epoch从新的模型初始化/RNG开始，不能接着profile状态训练。
 
-```bash
-HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_CACHE" \
-  .venv/bin/python tools/pretrain_imagenet.py --config configs/imagenet_rtformer_original.yaml --device cuda --precision bf16 \
-  --batch-size 128 --workers 0 --dry-run --out "$RUN_DIR/rtformer_in1k.pth"
-```
+报告排除warmup后的样本吞吐、step wall time、DataLoader等待时间、GPU利用率（可并行采样 `nvidia-smi dmon`）、torch peak allocated/reserved VRAM、CPU RSS/内存、worker等待及磁盘I/O。只按测量结果调节microbatch、现有 `--workers` 和代码实际支持的数据loader选项（pin memory、persistent workers、prefetch）；一次改动后重测。GPU内存、CPU、loader或I/O瓶颈要分别诊断，不要猜测。
 
-两种 dry-run 都成功，才开始正式 300 epochs。正式训练按每 8 个 microbatch 累积；epoch末尾不足8个的尾窗仍会做一次更新，并以该窗实际样本总数归一梯度。batch-128 dry-run 若 OOM，记录显存峰值并诊断；正式运行若 physical batch 128 无法容纳，先定位显存、模型或worker瓶颈，不得静默改写有效 batch。
+如batch 128无法承载，可选择能整除1024的microbatch并相应调整累积数，例如64×16或32×32；单卡有效batch始终为1024，不因显存静默缩小。保持原文LR，不按effective batch变化重缩放；保留bf16、完整增强及同一官方结构。若profiling后仍不能满足目标，停止正式训练并汇报证据。
 
-### 5. 运行正式预训练
+### 5. 确认周期权重快照
+
+正式训练必须保留滚动 `.last.pth`、validation top-1 `.pth`，并额外保留每25个**已完成epoch**的独立 `.pth`：epoch 25、50、75、100、125、150、175、200、225、250、275、300。当前 `--snapshot-every` 已支持此周期快照；运行前用 `tools/pretrain_imagenet.py --help` 和保存代码确认它会在完成epoch后输出独立文件。它保存backbone-only tensors供加载/评估，不是完整resume checkpoint；完整训练状态仍由 `.last.pth` 提供。
+
+检查 `RUN_DIR` 有空间保存12份backbone-only快照及last/best。无需另起进程复制快照；由训练入口在epoch完成后独立写出。
+
+### 6. 运行正式预训练
 
 服务器单卡正式命令：
 
@@ -133,26 +135,30 @@ set -o pipefail
 HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_CACHE" \
   .venv/bin/python tools/pretrain_imagenet.py --config configs/imagenet_rtformer_original.yaml --device cuda --precision bf16 \
   --batch-size 128 --accumulation-steps 8 --epochs 300 --workers 10 --eval-every 5 \
+  --snapshot-every 25 \
   --out "$RUN_DIR/rtformer_in1k.pth" 2>&1 | tee "$RUN_DIR/train.log"
 ```
 
-脚本使用原文 AdamW/cosine 和增强超参数，外加物理 batch 128 × accumulation 8。尾窗按其样本实际总数归一；scheduler 和 global step 只在 optimizer update 后推进。MixUp/CutMix 生成 soft labels，以 soft-target cross entropy 训练；验证仍用原始整数标签计算 top-1。Mix/Cut 0.5切换、无 label smoothing、timm crop/interpolation 是未由原文指定的实现默认。BF16 是用户指定的运行精度覆盖；输入图像先解码为 RGB，再转 normalized FP32 tensors，不需要BF16格式数据集。若 OOM，先保存现场并诊断显存、其他进程、workers、数据内存和共享内存；调整 microbatch 时必须同步修改累积步数并保持有效 batch 1024，否则记录为偏离原文的实验。
+按profile验证过的实际microbatch、累积和workers替换命令参数；有效batch保持1024。使用原文AdamW/cosine、增强与完整网络，尾窗按实际样本总数归一，scheduler/global step只在optimizer update后推进。未指定的head、bicubic crop和Mix/Cut概率仍标作工程选择。用户要求BF16；图片仍解码为RGB并转FP32输入。不得为减负静默改结构、精度或增强。
 
 用户预计的 dummy-data 时间约 17–20 小时只用于规划参考；ImageNet 下载、解码、增强、验证与checkpoint开销会改变实际时长。以脚本 ETA 和实测吞吐为准。
 
-### 6. 断点恢复与产物
+### 7. 断点恢复与产物
 
-入口每个 epoch 原子更新完整训练 checkpoint：`<输出名>.last.pth`，包含模型、优化器、精度 scaler、epoch、最佳精度、随机状态和 schedule。中断后只在相同 world size、updates/epoch、batch、累积步数、LR、WD、warmup、precision 配置下执行 `--resume`；checkpoint保存global optimizer step，scheduler从global step继续。示例：
+入口每个epoch原子更新完整训练checkpoint：`<输出名>.last.pth`，包含模型、优化器、精度scaler、epoch、best、随机状态和schedule。`--snapshot-every 25` 另存epoch25倍数的backbone-only `.pth`，不包含optimizer/RNG，不能用作resume输入。中断后从 `.last.pth` 恢复，只在相同world size、updates/epoch、batch、累积步数、LR、WD、warmup、precision、增强和模型配置下执行 `--resume`；checkpoint保存global optimizer step，scheduler从global step继续。
 
 ```bash
   .venv/bin/python tools/pretrain_imagenet.py --config configs/imagenet_rtformer_original.yaml \
   --device cuda --precision bf16 --batch-size 128 --accumulation-steps 8 --epochs 300 \
-  --workers 10 --eval-every 5 --resume --out "$RUN_DIR/rtformer_in1k.pth"
+  --workers 10 --eval-every 5 --snapshot-every 25 --resume \
+  --out "$RUN_DIR/rtformer_in1k.pth"
 ```
+
+从周期快照恢复不支持训练续跑；快照仅用于单独加载模型或评估。训练续跑一律从完整 `.last.pth` 恢复。
 
 `rtformer_in1k.pth` 仅在验证 top-1 提升时更新，保存 ImageNet 分类阶段完整训练过的 RTFormer stage1–5 trunk tensors（包括两个 stage5 分支；不含临时 GAP+1000类分类 head、不含未参与分类 forward 的 DAPPM）。`.last.pth` 是可恢复的训练态完整 checkpoint，不应作为 ADE backbone 初始化文件。日志、环境快照与 checkpoint 放在 `$RUN_DIR`，不得提交到 git。
 
-### 7. 完成后核对并汇报
+### 8. 完成后核对并汇报
 
 确认 checkpoint 存在且可用 `torch.load(path, map_location="cpu", weights_only=True)` 读取 `backbone` tensor dict；用 `RTFormer().load_pretrained(path)` 做严格 trunk coverage/shape 检查，DAPPM/segmentation head 未在分类阶段训练。记录并汇报：实际 GPU/driver/capability/VRAM，torch/vision/CUDA 版本与 BF16 结果，ImageNet splits 行数及许可/cache状态，dry-run结果，300 epochs完成数、耗时、吞吐、最佳 validation top-1、last/best checkpoint 路径、加载 smoke test结果、是否中断/OOM。若只完成一部分，明确说明；不要启动 ADE20K teacher、codec Stage 1/2，不上传或 push 文件。
 
