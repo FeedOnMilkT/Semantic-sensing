@@ -10,7 +10,7 @@
 
 ### 目标与边界
 
-只执行本仓库的 RTFormer ImageNet-1K 分类骨干预训练，最终产出可直接由 `src/models/backbones/rtformer.py::load_pretrained()` 加载的 backbone 权重。使用单卡、per-step batch size 128、BF16 autocast、100 epochs。100 epochs、batch 128、BF16、本文选择的 LR/WD/warmup/增强方案均为本次工程运行设置，论文没有规定 ImageNet 预训练配方。论文 §5.4 的 ADE20K teacher 预算是 160,000 steps；不要把这个步数或 codec Stage 1 的 100 epochs 套到 ImageNet。本次不启动 ADE20K teacher、codec、Stage 2、部署导出，也不上传数据或权重。
+只执行本仓库的 RTFormer ImageNet-1K 分类骨干预训练，使用 `configs/imagenet_rtformer_original.yaml` 配方入口，最终产出可由 `src/models/backbones/rtformer.py::load_pretrained()` 严格校验并加载的 trunk 权重。ImageNet 主 recipe 按 RTFormer 原论文补充材料 Table 6：300 epochs、AdamW lr=5e-4、WD=.04、betas=(.9,.999)、cosine min lr=5e-6、5-epoch linear warmup from 5e-7、RandAug(9,.5)、color jitter=.4、mixup alpha=.2、cutmix alpha=1.0、random erasing=.25、drop path=0.0。单卡使用 physical batch 128 × accumulation 8，目标有效 batch=1024。用户指定 BF16 autocast 是工程覆盖，不是原文精度。原文没有列明 label smoothing、crop/interpolation、Mixup/CutMix 切换概率或分类 head；当前实现分别采用无 label smoothing、timm bicubic ImageNet crop、mix/cut 各 0.5、GAP 拼接 stage5 两支后的 1000 类线性 head，这些是显式实现推断。分类只训练 stage1–5 trunk和临时 head；导出不含分类 head，也不含分类阶段未使用的 DAPPM。由于本轮替换为官方 RTFormer-Base topology，旧简化 trunk 的 ImageNet 权重会被严格拒绝，必须重新预训练。论文 §5.4 的最终 ADE20K teacher 是另一个阶段：11-way（10目标+背景）160,000 steps；本次不启动 teacher、codec、Stage 2、部署导出，也不上传数据或权重。不要混用 ADE teacher 的官方150类参考配置或 codec Stage 1 的100 epochs。
 
 数据文件本身不需要是 BF16。HF ImageNet 样本解码为 RGB 图像；当前 loader 经变换得到归一化 FP32 输入张量，分类标签为整数类别 ID。BF16 指 CUDA autocast 下模型运算使用的混合精度，不是需要另行下载的“BF16 数据集”，也不改变 label dtype。
 
@@ -66,10 +66,16 @@ assert torch.cuda.is_bf16_supported(), "当前 GPU/wheel 不支持 BF16；停止
 PY
 ```
 
-仅在硬件和 driver 允许该组合且上述探测通过后，记录 torch/torchvision/CUDA runtime 版本，再安装项目依赖。该依赖文件不声明 torch/torchvision；安装后再次核对版本和 BF16，若变化则停止，不要继续训练：
+仅在硬件和 driver 允许该组合且上述探测通过后，记录 torch/torchvision/CUDA runtime 版本，再把该 GPU wheel 固定为解析 constraint，避免 timm 的依赖解析悄悄替换 CUDA wheel：
 
 ```bash
-uv pip install --python .venv/bin/python -r requirements-imagenet.txt
+.venv/bin/python - <<'PY' > "$RUN_DIR/torch-constraints.txt"
+import torch, torchvision
+print(f"torch=={torch.__version__}")
+print(f"torchvision=={torchvision.__version__}")
+PY
+uv pip install --python .venv/bin/python -r requirements-imagenet.txt \
+  --constraint "$RUN_DIR/torch-constraints.txt"
 .venv/bin/python -c 'import torch, torchvision; print(torch.__version__, torchvision.__version__, torch.version.cuda); assert torch.cuda.is_available() and torch.cuda.is_bf16_supported()'
 uv pip freeze --python .venv/bin/python > "$RUN_DIR/requirements.lock.txt"
 .venv/bin/python -m pip --version
@@ -90,11 +96,11 @@ uv pip freeze --python .venv/bin/python > "$RUN_DIR/requirements.lock.txt"
 
 ```bash
 HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_CACHE" \
-  .venv/bin/python tools/pretrain_imagenet.py --device cuda --precision bf16 \
+  .venv/bin/python tools/pretrain_imagenet.py --config configs/imagenet_rtformer_original.yaml --device cuda --precision bf16 \
   --prepare-data-only --workers 0 --out "$RUN_DIR/rtformer_in1k.pth"
 ```
 
-该命令会按 HF dataset builder 下载/准备 train/validation 数据到 HF cache，检查标准 ImageNet-1K 的 train=1,281,167、validation=50,000、两 split 标签元数据各有 1000 类且 class names 完全相同；仅读取 Arrow 元数据，不遍历解码每一张图。若 HF 公开 builder 版本有差异，不能弱化为“非空即可”：先查清 split/config，明确报告实测长度和元数据差异，经用户确认数据仍为完整 ImageNet-1K 后再继续。此命令不建模、不训练、不写 checkpoint。若是 cache 残缺或下载中断，修复 cache/download 后复查；不要开始 dry-run 或 100 epoch。
+该命令会按 HF dataset builder 下载/准备 train/validation 数据到 HF cache，检查标准 ImageNet-1K 的 train=1,281,167、validation=50,000、两 split 标签元数据各有 1000 类且 class names 完全相同；仅读取 Arrow 元数据，不遍历解码每一张图。若 HF 公开 builder 版本有差异，不能弱化为“非空即可”：先查清 split/config，明确报告实测长度和元数据差异，经用户确认数据仍为完整 ImageNet-1K 后再继续。此命令不建模、不训练、不写 checkpoint。若是 cache 残缺或下载中断，修复 cache/download 后复查；不要开始 dry-run 或 300-epoch 训练。
 
 ### 4. 真实数据小批 dry-run
 
@@ -102,7 +108,7 @@ HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_
 
 ```bash
 HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_CACHE" \
-  .venv/bin/python tools/pretrain_imagenet.py --device cuda --precision bf16 \
+  .venv/bin/python tools/pretrain_imagenet.py --config configs/imagenet_rtformer_original.yaml --device cuda --precision bf16 \
   --batch-size 2 --workers 0 --dry-run --out "$RUN_DIR/rtformer_in1k.pth"
 ```
 
@@ -112,11 +118,11 @@ batch 2 通过后再用正式 batch 做一次真实数据显存/吞吐小测，�
 
 ```bash
 HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_CACHE" \
-  .venv/bin/python tools/pretrain_imagenet.py --device cuda --precision bf16 \
+  .venv/bin/python tools/pretrain_imagenet.py --config configs/imagenet_rtformer_original.yaml --device cuda --precision bf16 \
   --batch-size 128 --workers 0 --dry-run --out "$RUN_DIR/rtformer_in1k.pth"
 ```
 
-两种 dry-run 都成功，才开始正式 100 epochs。batch-128 dry-run 若 OOM，记录显存峰值并诊断；不得改成较小 batch 后沿用“有效 batch 128”的说法，因为当前脚本没有梯度累积。
+两种 dry-run 都成功，才开始正式 300 epochs。正式训练按每 8 个 microbatch 累积；epoch末尾不足8个的尾窗仍会做一次更新，并以该窗实际样本总数归一梯度。batch-128 dry-run 若 OOM，记录显存峰值并诊断；正式运行若 physical batch 128 无法容纳，先定位显存、模型或worker瓶颈，不得静默改写有效 batch。
 
 ### 5. 运行正式预训练
 
@@ -125,30 +131,30 @@ HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_
 ```bash
 set -o pipefail
 HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_CACHE" \
-  .venv/bin/python tools/pretrain_imagenet.py --device cuda --precision bf16 \
-  --batch-size 128 --epochs 100 --workers 10 --eval-every 5 \
+  .venv/bin/python tools/pretrain_imagenet.py --config configs/imagenet_rtformer_original.yaml --device cuda --precision bf16 \
+  --batch-size 128 --accumulation-steps 8 --epochs 300 --workers 10 --eval-every 5 \
   --out "$RUN_DIR/rtformer_in1k.pth" 2>&1 | tee "$RUN_DIR/train.log"
 ```
 
-脚本当前使用 AdamW，LR `1e-4`、weight decay `0.05`、warmup 5 epochs、cosine schedule、224 crop、label smoothing 0.1；这些是此代码运行配方/工程默认，不是论文 ImageNet 要求。除非有可复核依据，不要在运行中改变计划值。单卡 effective batch 即 128。若 OOM，先保存现场、检查显存与其他进程、workers、数据内存和共享内存；不要静默减 batch。当前入口没有梯度累积参数；若要将 microbatch 调低并保持有效 batch 128，须先实现并验证梯度累积，再重跑真实数据 dry-run，否则暂停并报告。
+脚本使用原文 AdamW/cosine 和增强超参数，外加物理 batch 128 × accumulation 8。尾窗按其样本实际总数归一；scheduler 和 global step 只在 optimizer update 后推进。MixUp/CutMix 生成 soft labels，以 soft-target cross entropy 训练；验证仍用原始整数标签计算 top-1。Mix/Cut 0.5切换、无 label smoothing、timm crop/interpolation 是未由原文指定的实现默认。BF16 是用户指定的运行精度覆盖；输入图像先解码为 RGB，再转 normalized FP32 tensors，不需要BF16格式数据集。若 OOM，先保存现场并诊断显存、其他进程、workers、数据内存和共享内存；调整 microbatch 时必须同步修改累积步数并保持有效 batch 1024，否则记录为偏离原文的实验。
 
 用户预计的 dummy-data 时间约 17–20 小时只用于规划参考；ImageNet 下载、解码、增强、验证与checkpoint开销会改变实际时长。以脚本 ETA 和实测吞吐为准。
 
 ### 6. 断点恢复与产物
 
-入口每个 epoch 原子更新完整训练 checkpoint：`<输出名>.last.pth`，包含模型、优化器、精度 scaler、epoch、最佳精度、随机状态和 schedule。中断后只在相同 world size、steps/epoch、epoch、batch、LR、WD、warmup、precision 配置下执行 `--resume`；脚本会检查关键 schedule。示例：
+入口每个 epoch 原子更新完整训练 checkpoint：`<输出名>.last.pth`，包含模型、优化器、精度 scaler、epoch、最佳精度、随机状态和 schedule。中断后只在相同 world size、updates/epoch、batch、累积步数、LR、WD、warmup、precision 配置下执行 `--resume`；checkpoint保存global optimizer step，scheduler从global step继续。示例：
 
 ```bash
-.venv/bin/python tools/pretrain_imagenet.py --device cuda --precision bf16 \
-  --batch-size 128 --epochs 100 --workers 10 --eval-every 5 \
-  --resume --out "$RUN_DIR/rtformer_in1k.pth"
+  .venv/bin/python tools/pretrain_imagenet.py --config configs/imagenet_rtformer_original.yaml \
+  --device cuda --precision bf16 --batch-size 128 --accumulation-steps 8 --epochs 300 \
+  --workers 10 --eval-every 5 --resume --out "$RUN_DIR/rtformer_in1k.pth"
 ```
 
-`rtformer_in1k.pth` 仅在验证 top-1 提升时更新，保存的是可由 ADE20K RTFormer loader 读取的 backbone tensors（不含临时 1000 类 head；不含分类预训练 forward 未使用的 DAPPM）。`.last.pth` 是可恢复的训练态完整 checkpoint，不应作为 ADE backbone 初始化文件。日志、环境快照与 checkpoint 放在 `$RUN_DIR`，不得提交到 git。
+`rtformer_in1k.pth` 仅在验证 top-1 提升时更新，保存 ImageNet 分类阶段完整训练过的 RTFormer stage1–5 trunk tensors（包括两个 stage5 分支；不含临时 GAP+1000类分类 head、不含未参与分类 forward 的 DAPPM）。`.last.pth` 是可恢复的训练态完整 checkpoint，不应作为 ADE backbone 初始化文件。日志、环境快照与 checkpoint 放在 `$RUN_DIR`，不得提交到 git。
 
 ### 7. 完成后核对并汇报
 
-确认 checkpoint 存在且可用 `torch.load(path, map_location="cpu", weights_only=True)` 读取 `backbone` tensor dict；用 `RTFormer().load_pretrained(path)` 做加载 smoke test，检查缺失项只包含未导出的 `dappm.*`，无意外 unexpected key。记录并汇报：实际 GPU/driver/capability/VRAM，torch/vision/CUDA 版本与 BF16 结果，ImageNet splits 行数及许可/cache状态，dry-run结果，epoch完成数、耗时、吞吐、最佳 validation top-1、last/best checkpoint 路径、加载 smoke test结果、是否中断/OOM。若只完成一部分，明确说明；不要启动 ADE20K teacher、codec Stage 1/2，不上传或 push 文件。
+确认 checkpoint 存在且可用 `torch.load(path, map_location="cpu", weights_only=True)` 读取 `backbone` tensor dict；用 `RTFormer().load_pretrained(path)` 做严格 trunk coverage/shape 检查，DAPPM/segmentation head 未在分类阶段训练。记录并汇报：实际 GPU/driver/capability/VRAM，torch/vision/CUDA 版本与 BF16 结果，ImageNet splits 行数及许可/cache状态，dry-run结果，300 epochs完成数、耗时、吞吐、最佳 validation top-1、last/best checkpoint 路径、加载 smoke test结果、是否中断/OOM。若只完成一部分，明确说明；不要启动 ADE20K teacher、codec Stage 1/2，不上传或 push 文件。
 
 ### 官方参考
 
@@ -157,3 +163,5 @@ HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" HF_DATASETS_CACHE="$HF_DATASETS_
 - [uv Python 管理](https://docs.astral.sh/uv/guides/install-python/)
 - [uv CLI reference](https://docs.astral.sh/uv/reference/cli/)
 - [Hugging Face gated datasets](https://huggingface.co/docs/hub/datasets-gated)
+- [RTFormer original supplement, Table 6 ImageNet recipe](https://papers.nips.cc/paper_files/paper/2022/file/30e10e671c5e43edb67eb257abb6c3ea-Supplemental-Conference.pdf)
+- [timm RandAugment and Mixup/CutMix implementation](https://github.com/huggingface/pytorch-image-models/tree/main/timm/data)

@@ -1,18 +1,14 @@
 #!/usr/bin/env python
-"""ImageNet-1K classification pretraining for the RTFormer backbone.
+"""ImageNet-1K classification pretraining for the RTFormer-Base trunk.
 
-Trains RTFormer's trunk (stem->stage5, via forward_trunk -> s32) + a linear
-classifier. DAPPM is not part of the pretraining forward and is excluded from the
-exported backbone checkpoint. DDP, BF16/FP16 autocast, cosine LR with warmup,
-label smoothing, per-epoch resume checkpoint, and best-validation backbone export.
-
-Launch (4 GPUs, batch is PER-GPU):
-  HF_HOME=/data/sidney/hf-cache CUDA_VISIBLE_DEVICES=0,1,4,5 \
-    torchrun --nproc_per_node=4 --master_port=29701 tools/pretrain_imagenet.py \
-    --epochs 100 --batch-size 128 --lr 1e-4 --precision bf16 --resume \
-    --out /data/sidney/checkpoints/semantic-sensing/pretrained/rtformer_in1k.pth
+Uses the official supplement's 300-epoch AdamW/cosine recipe and augmentations.
+Physical batch 128 x accumulation 8 gives the paper's effective batch 1024 on
+one GPU. BF16 is the requested project execution override, not the paper's stated
+precision. The temporary GAP+linear classifier pools both stage-5 streams; DAPPM
+and segmentation heads are not part of ImageNet classification.
 """
 import argparse
+from contextlib import nullcontext
 import math
 import os
 import random
@@ -28,6 +24,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 import torchvision.transforms as T
+from timm.data import Mixup
+from timm.data.transforms_factory import transforms_imagenet_train
+import yaml
 from PIL import Image
 
 from src.models.backbones import RTFormer
@@ -41,17 +40,26 @@ _IMAGENET1K_ROWS = {"train": 1_281_167, "validation": 50_000}
 
 
 class ClsModel(nn.Module):
-    """RTFormer trunk (s32) -> global avg pool -> linear classifier."""
-    def __init__(self, num_classes=1000):
+    """RTFormer trunk -> GAP of both stage-5 streams -> temporary 1000-way head.
+
+    The paper reports ImageNet classification but not its classifier-head design;
+    pooling and concatenating both streams is an explicit engineering choice that
+    ensures every trunk branch receives classification gradients.
+    """
+    def __init__(self, num_classes=1000, drop_path_rate=0.0,
+                 use_injection=(True, False)):
         super().__init__()
-        self.backbone = RTFormer()                       # Base defaults
-        c32 = self.backbone.out_channels["s32"]          # 512
-        self.head = nn.Linear(c32, num_classes)
+        self.backbone = RTFormer(drop_path_rate=drop_path_rate,
+                                 use_injection=tuple(use_injection))
+        c_h = self.backbone.split_channels["mid"][0]
+        c_l = self.backbone.out_channels["s32"]
+        self.head = nn.Linear(c_h + c_l, num_classes)
 
     def forward(self, x):
-        f = self.backbone.forward_trunk(x)               # B, 512, H/32, W/32
-        f = F.adaptive_avg_pool2d(f, 1).flatten(1)       # B, 512
-        return self.head(f)
+        high, low = self.backbone.forward_trunk(x)
+        high = F.adaptive_avg_pool2d(high, 1).flatten(1)
+        low = F.adaptive_avg_pool2d(low, 1).flatten(1)
+        return self.head(torch.cat((high, low), dim=1))
 
 
 class HFImageNet(Dataset):
@@ -97,30 +105,57 @@ class SyntheticImageNet(Dataset):
         return self.tf(image), i
 
 
-def build_transforms(img_size):
-    train = T.Compose([
-        T.RandomResizedCrop(img_size, scale=(0.08, 1.0)),
-        T.RandomHorizontalFlip(),
-        T.ColorJitter(0.4, 0.4, 0.4),
-        T.ToTensor(), T.Normalize(_MEAN, _STD),
-    ])
+def build_transforms(img_size, recipe):
+    # Supplement notation RandAug(9, 0.5) is interpreted with timm's standard
+    # rand-m9-mstd0.5 policy (two ops/image); crop/interpolation are not specified
+    # by the paper and use timm's ImageNet defaults (engineering choices).
+    train = transforms_imagenet_train(
+        img_size=img_size,
+        auto_augment=recipe["rand_augment"],
+        color_jitter=recipe["color_jitter"], re_prob=recipe["random_erasing"],
+        # timm disables color jitter whenever RandAugment is active unless this
+        # override is set; the supplement lists both augmentations.
+        force_color_jitter=True,
+        re_mode="const", re_count=1, interpolation=recipe["interpolation"],
+        mean=_MEAN, std=_STD,
+    )
     val = T.Compose([
-        T.Resize(int(img_size * 256 / 224)), T.CenterCrop(img_size),
+        T.Resize(int(img_size * 256 / 224), interpolation=T.InterpolationMode.BICUBIC),
+        T.CenterCrop(img_size),
         T.ToTensor(), T.Normalize(_MEAN, _STD),
     ])
     return train, val
 
 
-def cosine_lr(step, total, base_lr, warmup, min_lr=1e-5):
+def cosine_lr(step, total, base_lr, warmup, min_lr=5e-6, warmup_start_lr=5e-7):
     if step < warmup:
-        return base_lr * (step + 1) / max(1, warmup)
-    t = (step - warmup) / max(1, total - warmup)
+        return warmup_start_lr + (base_lr - warmup_start_lr) * step / max(1, warmup)
+    t = (step - warmup) / max(1, total - warmup - 1)
     return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * t))
 
 
 def fmt_eta(sec):
     sec = int(max(0, sec)); h, r = divmod(sec, 3600); m, s = divmod(r, 60)
     return f"{h:d}:{m:02d}:{s:02d}"
+
+
+def _schedule_state(args, recipe, world, effective_batch, updates_per_epoch):
+    """Capture every setting that changes data, augmentation, or update timing."""
+    recipe_fields = (
+        "drop_path_rate", "use_injection", "rand_augment", "color_jitter",
+        "random_erasing", "interpolation", "mixup_alpha", "cutmix_alpha",
+        "mixup_cutmix_switch_prob", "label_smoothing", "num_classes",
+    )
+    return {
+        "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
+        "weight_decay": args.weight_decay, "warmup_epochs": args.warmup_epochs,
+        "warmup_start_lr": args.warmup_start_lr, "min_lr": args.min_lr,
+        "img_size": args.img_size, "precision": args.precision,
+        "accumulation_steps": args.accumulation_steps, "world_size": world,
+        "effective_batch": effective_batch,
+        "updates_per_epoch": updates_per_epoch,
+        "recipe": {key: recipe[key] for key in recipe_fields},
+    }
 
 
 def autocast_context(device, precision):
@@ -153,22 +188,33 @@ def evaluate(model, loader, device, precision="fp32"):
 
 
 def main():
+    default_config = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "configs", "imagenet_rtformer_original.yaml")
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--config", default=default_config)
+    boot_args, _ = bootstrap.parse_known_args()
+    with open(boot_args.config, encoding="utf-8") as f:
+        recipe = yaml.safe_load(f)
     ap = argparse.ArgumentParser()
-    ap.add_argument("--epochs", type=int, default=100,
-                    help="100 is an engineering default; the paper does not specify ImageNet pretraining epochs")
-    ap.add_argument("--batch-size", type=int, default=128, help="PER-GPU; server prompt targets effective batch 128")
-    ap.add_argument("--lr", type=float, default=1e-4,
-                    help="engineering default scaled from the repository's larger-batch run; not paper-specified")
-    ap.add_argument("--weight-decay", type=float, default=0.05)
-    ap.add_argument("--warmup-epochs", type=int, default=5)
-    ap.add_argument("--img-size", type=int, default=224)
-    ap.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default="bf16",
+    ap.add_argument("--config", default=boot_args.config)
+    ap.add_argument("--epochs", type=int, default=recipe["epochs"],
+                    help="official supplement ImageNet recipe: 300 epochs")
+    ap.add_argument("--batch-size", type=int, default=recipe["batch_size"],
+                    help="physical batch per rank; default 128 x 8 accumulation = 1024 on one GPU")
+    ap.add_argument("--accumulation-steps", type=int, default=recipe["accumulation_steps"],
+                    help="microbatches per optimizer update; paper effective batch is 1024")
+    ap.add_argument("--lr", type=float, default=recipe["lr"])
+    ap.add_argument("--weight-decay", type=float, default=recipe["weight_decay"])
+    ap.add_argument("--warmup-epochs", type=int, default=recipe["warmup_epochs"])
+    ap.add_argument("--warmup-start-lr", type=float, default=recipe["warmup_start_lr"])
+    ap.add_argument("--min-lr", type=float, default=recipe["min_lr"])
+    ap.add_argument("--img-size", type=int, default=recipe["img_size"])
+    ap.add_argument("--precision", choices=("fp32", "bf16", "fp16"), default=recipe["precision"],
                     help="BF16 autocast is the requested server setting; images remain RGB/FP32 inputs")
-    ap.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
-    ap.add_argument("--label-smoothing", type=float, default=0.1)
-    ap.add_argument("--workers", type=int, default=10)
-    ap.add_argument("--eval-every", type=int, default=5)
-    ap.add_argument("--snapshot-every", type=int, default=0,
+    ap.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default=recipe["device"])
+    ap.add_argument("--workers", type=int, default=recipe["workers"])
+    ap.add_argument("--eval-every", type=int, default=recipe["eval_every"])
+    ap.add_argument("--snapshot-every", type=int, default=recipe["snapshot_every"],
                     help="if >0, also keep a permanent backbone snapshot every N epochs")
     ap.add_argument("--out", default="/data/sidney/checkpoints/semantic-sensing/pretrained/rtformer_in1k.pth")
     ap.add_argument("--resume", action="store_true")
@@ -179,8 +225,9 @@ def main():
     ap.add_argument("--synthetic-data", action="store_true",
                     help="use a four-sample local fixture; only allowed together with --dry-run")
     args = ap.parse_args()
-    if args.epochs < 1 or args.batch_size < 1 or args.eval_every < 1 or args.workers < 0:
-        ap.error("epochs, batch-size and eval-every must be positive; workers must be nonnegative")
+    if (args.epochs < 1 or args.batch_size < 1 or args.accumulation_steps < 1
+            or args.eval_every < 1 or args.workers < 0):
+        ap.error("epochs, batch-size, accumulation-steps and eval-every must be positive; workers must be nonnegative")
     if args.synthetic_data and not args.dry_run:
         ap.error("--synthetic-data is only allowed with --dry-run; it must never be used for training")
     if args.synthetic_data and args.prepare_data_only:
@@ -212,8 +259,14 @@ def main():
     if args.precision == "fp16" and torch.device(device).type != "cuda":
         raise RuntimeError("FP16 autocast is currently supported only on CUDA")
     is_main = rank == 0
+    effective_batch = args.batch_size * world * args.accumulation_steps
+    if not args.dry_run and effective_batch != recipe["effective_batch_size"]:
+        raise RuntimeError(
+            f"effective batch must match configured {recipe['effective_batch_size']}; got "
+            f"{args.batch_size}*{world}*{args.accumulation_steps}={effective_batch}. "
+            "Adjust --accumulation-steps explicitly.")
 
-    tf_train, tf_val = build_transforms(args.img_size)
+    tf_train, tf_val = build_transforms(args.img_size, recipe)
     if is_main:
         source = "synthetic fixture" if args.synthetic_data else f"ImageNet-1K (HF_HOME={os.environ.get('HF_HOME')})"
         log.info(f"loading {source} ...")
@@ -256,23 +309,30 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, sampler=val_sampler,
                             num_workers=min(args.workers, 2),
                             pin_memory=torch.device(device).type == "cuda", persistent_workers=False)
-    spe = len(train_loader)
-    total_steps = args.epochs * spe
-    warmup_steps = args.warmup_epochs * spe
+    updates_per_epoch = math.ceil(len(train_loader) / args.accumulation_steps)
+    total_steps = args.epochs * updates_per_epoch
+    warmup_steps = args.warmup_epochs * updates_per_epoch
 
-    model = ClsModel().to(device)
+    model = ClsModel(num_classes=recipe["num_classes"],
+                     drop_path_rate=recipe["drop_path_rate"],
+                     use_injection=recipe["use_injection"]).to(device)
     core = DDP(model, device_ids=[local_rank], find_unused_parameters=True) if distributed else model
-    opt = torch.optim.AdamW(core.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW(core.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+                            betas=tuple(recipe["betas"]))
     scaler_enabled = args.precision == "fp16" and torch.device(device).type == "cuda"
     if hasattr(torch.amp, "GradScaler"):
         scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
     else:  # compatibility with older local CPU environments; server should use current CUDA PyTorch
         scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
-    crit = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    mixup_fn = Mixup(mixup_alpha=recipe["mixup_alpha"], cutmix_alpha=recipe["cutmix_alpha"],
+                     prob=1.0, switch_prob=recipe["mixup_cutmix_switch_prob"], mode="batch",
+                     label_smoothing=recipe["label_smoothing"],
+                     num_classes=recipe["num_classes"])
     if is_main:
         n = sum(p.numel() for p in model.parameters()) / 1e6
-        log.info(f"ClsModel params: {n:.2f}M | per-gpu bs={args.batch_size} world={world} "
-                 f"global_bs={args.batch_size*world} steps/epoch={spe} total_steps={total_steps}")
+        log.info(f"ClsModel params: {n:.2f}M | per-rank microbatch={args.batch_size} world={world} "
+                 f"accumulation={args.accumulation_steps} effective_bs={effective_batch} "
+                 f"updates/epoch={updates_per_epoch} total_updates={total_steps}")
 
     if args.dry_run:
         if torch.device(device).type == "cuda":
@@ -281,8 +341,10 @@ def main():
         x, y = next(iter(train_loader))
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         opt.zero_grad(set_to_none=True)
+        x, targets = mixup_fn(x, y)
         with autocast_context(device, args.precision):
-            loss = crit(core(x), y)
+            logits = core(x)
+            loss = -(targets * F.log_softmax(logits.float(), dim=-1)).sum(dim=-1).mean()
         if not torch.isfinite(loss):
             raise FloatingPointError(f"non-finite ImageNet dry-run train loss: {loss.detach()}")
         if scaler.is_enabled():
@@ -302,27 +364,29 @@ def main():
             memory = (f" peak_allocated={torch.cuda.max_memory_allocated(device) / 2**30:.2f}GiB"
                       f" peak_reserved={torch.cuda.max_memory_reserved(device) / 2**30:.2f}GiB"
                       if torch.device(device).type == "cuda" else "")
-            log.info(f"[dry-run] train_loss={float(loss):.4f} val_batch_top1={val_acc:.4f}; "
-                     f"real data, forward/backward, no checkpoint written{memory}")
+            log.info(f"[dry-run] source={'synthetic fixture' if args.synthetic_data else 'ImageNet HF'} "
+                     f"train_loss={float(loss.detach()):.4f} val_batch_top1={val_acc:.4f}; "
+                     f"forward/backward complete, no checkpoint written{memory}")
         if distributed:
             dist.barrier(); dist.destroy_process_group()
         return
 
     start_epoch = 0
     best_acc = 0.0
+    global_step = 0
     if args.resume and os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-        if ck.get("world_size", world) != world or ck.get("steps_per_epoch", spe) != spe:
-            raise RuntimeError("resume checkpoint world size or steps/epoch differs from this run")
+        if (ck.get("world_size", world) != world
+                or ck.get("updates_per_epoch", updates_per_epoch) != updates_per_epoch):
+            raise RuntimeError("resume checkpoint world size or optimizer updates/epoch differs")
         saved_schedule = ck.get("schedule", {})
-        requested_schedule = {"epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
-                              "weight_decay": args.weight_decay, "warmup_epochs": args.warmup_epochs,
-                              "precision": args.precision}
+        requested_schedule = _schedule_state(args, recipe, world, effective_batch, updates_per_epoch)
         if saved_schedule and saved_schedule != requested_schedule:
             raise RuntimeError(f"resume schedule differs: saved={saved_schedule}, requested={requested_schedule}")
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
         scaler.load_state_dict(ck.get("scaler", {}))
         start_epoch = ck["epoch"]
+        global_step = int(ck.get("global_step", start_epoch * updates_per_epoch))
         best_acc = float(ck.get("best_acc", 0.0))
         rank_rng = ck.get("rng_by_rank", [])
         if rank_rng:
@@ -334,33 +398,68 @@ def main():
         if is_main:
             log.info(f"resumed from {ckpt_path} -> start_epoch={start_epoch} best_acc={ck.get('best_acc',0):.4f}")
 
-    step = start_epoch * spe
     t0 = time.time(); run_steps = 0
     core.train()
     for ep in range(start_epoch, args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(ep)
-        for x, y in train_loader:
-            lr = cosine_lr(step, total_steps, args.lr, warmup_steps)
-            for g in opt.param_groups:
-                g["lr"] = lr
+        opt.zero_grad(set_to_none=True)
+        window_samples = 0
+        window_loss = 0.0
+        for micro_idx, (x, y) in enumerate(train_loader):
+            window_start = micro_idx % args.accumulation_steps == 0
+            update_now = ((micro_idx + 1) % args.accumulation_steps == 0
+                          or micro_idx + 1 == len(train_loader))
+            if window_start:
+                lr = cosine_lr(global_step, total_steps, args.lr, warmup_steps,
+                               min_lr=args.min_lr, warmup_start_lr=args.warmup_start_lr)
+                for group in opt.param_groups:
+                    group["lr"] = lr
             x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
-            opt.zero_grad(set_to_none=True)
-            with autocast_context(device, args.precision):
-                loss = crit(core(x), y)
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                scaler.step(opt); scaler.update()
-            else:
-                loss.backward()
-                opt.step()
-            if is_main:
-                run_steps += 1
-                if step % 50 == 0:
-                    eta = (time.time() - t0) / max(1, run_steps) * (total_steps - step - 1)
-                    log.info(f"ep{ep} [{step+1}/{total_steps} {100.0*(step+1)/total_steps:4.1f}%] "
-                             f"lr={lr:.2e} loss={float(loss):.3f} eta={fmt_eta(eta)}")
-            step += 1
+            x, targets = mixup_fn(x, y)
+            sync_context = (core.no_sync() if distributed and not update_now else nullcontext())
+            with sync_context:
+                with autocast_context(device, args.precision):
+                    logits = core(x)
+                    loss_sum = -(targets * F.log_softmax(logits.float(), dim=-1)).sum(dim=-1).sum()
+                if not torch.isfinite(loss_sum):
+                    raise FloatingPointError(f"non-finite ImageNet loss at epoch {ep + 1}")
+                if scaler.is_enabled():
+                    scaler.scale(loss_sum).backward()
+                else:
+                    loss_sum.backward()
+            window_samples += y.numel()
+            window_loss += float(loss_sum.detach())
+            if update_now:
+                if scaler.is_enabled():
+                    scaler.unscale_(opt)
+                for parameter in core.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(window_samples)
+                if scaler.is_enabled():
+                    old_scale = scaler.get_scale()
+                    scaler.step(opt)
+                    scaler.update()
+                    did_update = scaler.get_scale() >= old_scale
+                else:
+                    opt.step()
+                    did_update = True
+                opt.zero_grad(set_to_none=True)
+                if is_main and did_update:
+                    run_steps += 1
+                    if global_step % 50 == 0:
+                        eta = (time.time() - t0) / max(1, run_steps) * (total_steps - global_step - 1)
+                        log.info(f"ep{ep + 1} [{global_step + 1}/{total_steps} "
+                                 f"{100.0 * (global_step + 1) / total_steps:4.1f}%] "
+                                 f"lr={lr:.2e} loss={window_loss / window_samples:.3f} "
+                                 f"window_samples={window_samples} eta={fmt_eta(eta)}")
+                if did_update:
+                    global_step += 1
+                elif is_main:
+                    log.warning(f"[amp] skipped optimizer update at epoch {ep + 1}; "
+                                "global scheduler step was not advanced")
+                window_samples = 0
+                window_loss = 0.0
         # ---- end epoch: eval + checkpoint (rank0) ----
         acc = -1.0
         if (ep + 1) % args.eval_every == 0 or ep + 1 == args.epochs:
@@ -382,10 +481,10 @@ def main():
             torch.save({"model": model.state_dict(), "backbone": _backbone_for_export(model.backbone),
                         "opt": opt.state_dict(), "scaler": scaler.state_dict(),
                         "epoch": ep + 1, "best_acc": best_acc, "world_size": world,
-                        "steps_per_epoch": spe,
-                        "schedule": {"epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
-                                     "weight_decay": args.weight_decay, "warmup_epochs": args.warmup_epochs,
-                                     "precision": args.precision},
+                        "global_step": global_step,
+                        "updates_per_epoch": updates_per_epoch,
+                        "schedule": _schedule_state(args, recipe, world, effective_batch,
+                                                     updates_per_epoch),
                         "rng_by_rank": rng_by_rank}, tmp)
             os.replace(tmp, ckpt_path)
             # Export only on validation improvement. ADE20K loads this wrapper directly.

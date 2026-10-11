@@ -31,7 +31,7 @@ import numpy as np
 import torch
 
 from src.models.backbones.rtformer import (
-    RTFormer, GFA, CrossResAttention, RTFormerStage,
+    RTFormer, EABlock, ExternalAttention,
 )
 
 # RTFormer-Base widths (configs/cityscapes_mt_rtformer.yaml: args={}).
@@ -39,22 +39,13 @@ C = dict(c1=64, c2=128, c3=256, c4=512, mem=128, groups=8, cross_size=12)
 
 
 class ConvTrunk(torch.nn.Module):
-    """stem + stage1 + stage2 + stage3 bilateral fusion — the pure-conv subgraph
-    (no attention). Reuses a real RTFormer instance's layers so weights/shapes are
-    faithful. Returns (high @1/8, low @1/16)."""
+    """Official stem through stage 3, the pure-convolution sender subgraph."""
     def __init__(self, rt: RTFormer):
         super().__init__()
         self.rt = rt
 
     def forward(self, x):
-        rt = self.rt
-        s4 = rt.stage1(rt.stem(x))
-        high = rt.stage2(s4)
-        h3 = rt.s3_high(high)
-        l3 = rt.s3_low(high)
-        high = torch.relu(h3 + rt._up(rt.s3_l2h(l3), h3))
-        low = torch.relu(l3 + rt.s3_h2l(h3))
-        return high, low
+        return self.rt.forward_sender_mid(x)
 
 
 def build_specs(H, W):
@@ -77,21 +68,25 @@ def build_specs(H, W):
         ),
         # 2. #1 RISK: GFA grouped double-normalization (low branch @1/32, c4)
         "gfa": (
-            GFA(C["c4"], mem=C["mem"], groups=C["groups"]).eval(),
+            ExternalAttention(C["c4"], C["c4"], C["mem"],
+                              num_heads=C["groups"]).eval(),
             (t(1, C["c4"], h32, w32),),
             ["low_feat"],
         ),
-        # 3. cross-resolution attention: standard softmax MHA (Q=high, K/V=pooled low)
+        # 3. official cross attention uses pooled low-branch K/V and grouped conv
         "cross_res_attn": (
-            CrossResAttention(C["c2"], C["c4"], cross_size=C["cross_size"]).eval(),
+            EABlock((C["c2"], C["c4"]), (C["c2"], C["c4"]),
+                    num_heads=C["groups"], cross_size=C["cross_size"],
+                    use_injection=False).eval(),
             (t(1, C["c2"], h8, w8), t(1, C["c4"], h32, w32)),
             ["high_feat", "low_feat"],
         ),
-        # 4. one full stepped RTFormer block (stage5 layout: stride=1, low stays c4)
+        # 4. stage-4 transition includes official low stride-2 projection and injection.
         "rtformer_stage": (
-            RTFormerStage(C["c2"], C["c4"], C["c4"], 1,
-                          C["mem"], C["groups"], C["cross_size"]).eval(),
-            (t(1, C["c2"], h8, w8), t(1, C["c4"], h32, w32)),
+            EABlock((C["c2"], C["c3"]), (C["c2"], C["c4"]),
+                    num_heads=C["groups"], cross_size=C["cross_size"],
+                    use_injection=True).eval(),
+            (t(1, C["c2"], h8, w8), t(1, C["c3"], H // 16, W // 16)),
             ["high_feat", "low_feat"],
         ),
         # 5. whole backbone (dict output -> tuple-wrapped for a clean graph)

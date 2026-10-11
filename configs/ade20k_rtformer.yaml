@@ -1,5 +1,7 @@
-# RTFormer seg teacher on ADE20K (SceneParse150), faithful to the RTFormer paper
-# (Sec 4.1 Implementation Details, ADE20K paragraph):
+# RTFormer segmentation teacher on ADE20K. Training schedule follows RTFormer
+# §4.1 / PaddleSeg release/2.8's official 160k Base config, then the final
+# ten-object config below changes the target to 11 logits (10 objects+background)
+# as inferred from this project's main.tex; it is not the official 150-class run.
 #   batch 16, 160k iters, AdamW lr 1e-4 / weight_decay 0.05, poly power 0.9,
 #   aug = random scale [0.5,2.0] -> random crop -> random h-flip (no OHEM, no color
 #   jitter), ImageNet-pretrained backbone. Crop 512x512 = ADE20K community standard
@@ -23,6 +25,10 @@ model:
     # from-scratch under-trains badly. Drop this arg only for a scratch A/B.
     args:
       pretrained: /data/sidney/checkpoints/semantic-sensing/pretrained/rtformer_in1k.pth
+      drop_path_rate: 0.1
+      use_injection: [true, false]
+      cross_size: 12
+      spp_channels: 128
   heads:
     seg:
       name: seg

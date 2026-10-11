@@ -1,0 +1,29 @@
+# ImageNet-1K RTFormer-Base pretraining, aligned to RTFormer supplement Table 6.
+# Values marked as implementation choices are not specified by that table.
+epochs: 300
+batch_size: 128                  # physical per-rank microbatch
+accumulation_steps: 8            # 128 x 8 x world_size(1) = paper effective batch 1024
+effective_batch_size: 1024
+lr: 0.0005
+weight_decay: 0.04
+betas: [0.9, 0.999]
+warmup_epochs: 5
+warmup_start_lr: 0.0000005
+min_lr: 0.000005
+img_size: 224                    # common ImageNet size; supplement table does not state it
+precision: bf16                  # user-requested engineering override; paper table does not specify precision
+device: auto
+workers: 10
+eval_every: 5
+snapshot_every: 0
+drop_path_rate: 0.0              # supplement Table 6
+use_injection: [true, false]     # official PaddleSeg ADE Base topology; not specified in Table 6
+rand_augment: rand-m9-mstd0.5    # timm interpretation of RandAug(9, 0.5); two ops is timm default
+color_jitter: 0.4
+random_erasing: 0.25
+interpolation: bicubic            # implementation choice; table does not specify interpolation
+mixup_alpha: 0.2
+cutmix_alpha: 1.0
+mixup_cutmix_switch_prob: 0.5   # implementation choice; table reports alpha values only
+label_smoothing: 0.0             # implementation choice; not reported in original table
+num_classes: 1000

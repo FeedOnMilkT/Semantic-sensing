@@ -74,11 +74,13 @@ class _BoundedIGDN(GDN):
         return x * norm.sqrt().clamp(max=self.MAX_MULT)
 
 
-def _syn_block(cin, cout, act):
+def _syn_block(cin, cout, act, bounded_igdn=False):
     """Synthesis-side _block twin (same Sequential layout / state-dict keys as
-    hyperprior._block(inverse=True)) with the bounded IGDN. convbn tier unchanged."""
+    hyperprior._block(inverse=True)). Stock CompressAI IGDN is the default; the
+    bounded variant is retained only as an explicit numerical-stability ablation."""
     if act == "gdn":
-        return nn.Sequential(nn.Conv2d(cin, cout, 3, 1, 1, bias=True), _BoundedIGDN(cout))
+        igdn = _BoundedIGDN(cout) if bounded_igdn else GDN(cout, inverse=True)
+        return nn.Sequential(nn.Conv2d(cin, cout, 3, 1, 1, bias=True), igdn)
     return _block(cin, cout, 1, act=act, inverse=True)
 
 
@@ -113,9 +115,10 @@ class _SpatialGate(nn.Module):
 class FusedLatentBottleneck(nn.Module):
     def __init__(self, in_channels_high, in_channels_low, latent_channels=192,
                  hyper_channels=128, hidden=128, num_down=1, hyper_down=1,
-                 act="convbn", use_attn=False):
+                 act="convbn", use_attn=False, bounded_igdn=False):
         super().__init__()
         self.c_high, self.c_low = in_channels_high, in_channels_low
+        self.bounded_igdn = bool(bounded_igdn)
         # encoder: align x_h to x_l's grid, concat, joint analysis -> single y
         self.align_h = _block(in_channels_high, in_channels_high, stride=2, act=act)
         self.g_a = _Analysis(in_channels_high + in_channels_low, latent_channels,
@@ -126,16 +129,20 @@ class FusedLatentBottleneck(nn.Module):
         self.entropy_bottleneck = EntropyBottleneck(hyper_channels)
         self.gaussian_conditional = GaussianConditional(None)
         # decoder: shared trunk up to 1/16, low head first, high head mixes x̂_l back in.
-        # All synthesis IGDNs are the bounded variant (_BoundedIGDN) — the x̂_h path
-        # chains three of them, which is what blew up unbounded (see _BoundedIGDN).
+        # GDN ablations use stock CompressAI IGDN by default. The bounded variant
+        # remains an explicit experiment via bounded_igdn=true; final ConvBN path is
+        # unaffected.
         ups = [nn.Sequential(nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                             _syn_block(hidden, hidden, act=act))
+                             _syn_block(hidden, hidden, act=act,
+                                        bounded_igdn=self.bounded_igdn))
                for _ in range(num_down)]
-        self.g_s_trunk = nn.Sequential(_syn_block(latent_channels, hidden, act=act), *ups)
+        self.g_s_trunk = nn.Sequential(_syn_block(latent_channels, hidden, act=act,
+                                                 bounded_igdn=self.bounded_igdn), *ups)
         self.head_l = nn.Conv2d(hidden, in_channels_low, 3, 1, 1)
         self.head_h = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            _syn_block(hidden + in_channels_low, hidden, act=act),
+            _syn_block(hidden + in_channels_low, hidden, act=act,
+                       bounded_igdn=self.bounded_igdn),
             nn.Conv2d(hidden, in_channels_high, 3, 1, 1))
         self.attn_a = _SpatialGate(latent_channels) if use_attn else None
         self.attn_s = _SpatialGate(latent_channels) if use_attn else None

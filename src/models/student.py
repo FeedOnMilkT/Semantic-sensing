@@ -34,13 +34,13 @@ from .bottlenecks import build_bottleneck
 
 # backbone submodules on the SENDER side of each split (everything else + neck/decoder/
 # heads is the receiver tail that Stage 2 fine-tunes). Order matches rtformer.py forward.
-_ALL_BB = ("stem", "stage1", "stage2", "s3_high", "s3_low", "s3_l2h", "s3_h2l",
-           "stage4", "stage5", "dappm")
+_ALL_BB = ("conv1", "layer1", "layer2", "layer3", "layer3_", "compression3",
+           "layer4", "layer5", "dappm")
 _SENDER_BB = {
-    "early": ("stem", "stage1", "stage2"),
-    "mid":   ("stem", "stage1", "stage2", "s3_high", "s3_low", "s3_l2h", "s3_h2l"),
-    "late":  ("stem", "stage1", "stage2", "s3_high", "s3_low", "s3_l2h", "s3_h2l",
-              "stage4", "stage5"),
+    "early": ("conv1", "layer1", "layer2"),
+    "mid":   ("conv1", "layer1", "layer2", "layer3", "layer3_", "compression3"),
+    "late":  ("conv1", "layer1", "layer2", "layer3", "layer3_", "compression3",
+              "layer4", "layer5"),
 }
 
 
@@ -176,14 +176,10 @@ class SplitStudent(nn.Module):
 def split_in_channels(teacher, split):
     """Channels of the feature(s) that cross the split (drives the bottleneck width).
     Single int for early/neck; (c_high, c_low) tuple for the dual mid/late payload."""
-    oc = teacher.backbone.out_channels               # {s4:c1, s8:c2, s16:c3, s32:c4}
+    oc = teacher.backbone.out_channels
     if split == "neck":
         return teacher.neck.out_channels
-    if split == "early":
-        return oc["s8"]                              # stage2 feature channels (c2)
-    if split == "mid":
-        return (oc["s8"], oc["s16"])                 # (x_h c2=128, x_l c3=256)
-    return (oc["s8"], oc["s32"])                     # late: (x_h c2=128, x_l c4=512)
+    return teacher.backbone.split_channels[split]
 
 
 def build_student(cfg, teacher):
