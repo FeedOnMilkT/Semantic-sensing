@@ -1,4 +1,4 @@
-"""ADE20K (SceneParse150) semantic segmentation — seg-only teacher dataset.
+"""ADE20K semantic segmentation dataset for the paper's final ten-object task.
 
 Loaded from the HuggingFace parquet mirror `merve/scene_parse_150` (datasets>=4
 compatible; the official script-based `scene_parse_150` / `zhoubolei/...` FAIL on
@@ -6,10 +6,11 @@ datasets 5.0). Already cached on the data disk at
 `/data/sidney/hf-cache/hub/datasets--merve--scene_parse_150` (train 20210 / val
 2000 / test 3352; test is unlabeled). Public repo — no token needed.
 
-Label convention: the HF `annotation` PNG stores class ids directly, with
-0 = unlabeled/background and 1..150 = the 150 ADE20K classes. We remap to the
-standard training space: `id - 1` -> 0..149, and 0 (background) -> ignore_index
-(255). So num_classes=150, ignore_index=255 (matches base.yaml).
+`class_mode="ten_object"` maps the paper's ten foreground categories to labels
+1..10 and all other source labels, including source 0, to background 0. Source
+category ids follow CSAILVision's official one-based `objectInfo150.txt` table.
+`class_mode="150"` keeps the earlier 150-class protocol and maps source 0 to
+`ignore_index`.
 
 Augmentation (train only, `augment: true`) follows RTFormer's paper recipe
 (Sec 4.1, "other training settings are identical to those for Cityscapes"):
@@ -38,18 +39,57 @@ _STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 # our split name -> HF split name (HF uses "validation", we say "val" like cityscapes)
 _HF_SPLIT = {"train": "train", "val": "validation", "test": "test"}
 
+# Paper order: bed, cabinet, table, car, sofa, armchair, bathtub, door, desk, mirror.
+# Source ids are the one-based indices in CSAILVision/ADE20K objectInfo150.txt.
+TEN_OBJECT_SOURCE_IDS = (8, 11, 16, 21, 24, 31, 38, 15, 34, 28)
+TEN_OBJECT_NAMES = ("bed", "cabinet", "table", "car", "sofa", "armchair",
+                    "bathtub", "door", "desk", "mirror")
+_TEN_OBJECT_LOOKUP = np.zeros(151, dtype=np.int64)
+for _train_id, _source_id in enumerate(TEN_OBJECT_SOURCE_IDS, start=1):
+    _TEN_OBJECT_LOOKUP[_source_id] = _train_id
+
+
+def remap_ade20k_labels(annotation, class_mode="150", ignore_index=255):
+    """Map source PNG ids to either the 150-class or final 11-class train space."""
+    ann = np.asarray(annotation, dtype=np.int64)
+    if ann.size and (ann.min() < 0 or ann.max() > 150):
+        raise ValueError(f"ADE20K annotation ids outside expected 0..150: {ann.min()}..{ann.max()}")
+    if class_mode == "ten_object":
+        if ignore_index in range(11):
+            raise ValueError("ignore_index must not overlap ten-object train labels 0..10")
+        return _TEN_OBJECT_LOOKUP[ann]
+    if class_mode == "150":
+        seg = ann - 1
+        seg[seg < 0] = ignore_index
+        return seg
+    raise ValueError(f"unsupported ADE20K class_mode={class_mode!r}")
+
 
 class ADE20K(Dataset):
     def __init__(self, hf_repo="merve/scene_parse_150", split="train",
                  tasks=("seg",), size=(512, 512), num_classes=150,
                  ignore_index=255, augment=False, crop_size=(512, 512),
-                 scale_range=(0.5, 2.0)):
+                 scale_range=(0.5, 2.0), class_mode="150"):
         assert tuple(tasks) == ("seg",), "ADE20K is a seg-only scene-parsing set"
         self.split, self.tasks = split, list(tasks)
         # size=None -> return native resolution (for slide-window eval; needs batch=1)
         self.size = tuple(size) if size is not None else None
         self.num_classes = num_classes
         self.ignore_index = ignore_index
+        self.class_mode = str(class_mode)
+        if self.class_mode == "ten_object":
+            if num_classes != len(TEN_OBJECT_SOURCE_IDS) + 1:
+                raise ValueError("ten_object mode requires num_classes=11 (background + 10 objects)")
+            if len(set(TEN_OBJECT_SOURCE_IDS)) != len(TEN_OBJECT_SOURCE_IDS):
+                raise ValueError("ten-object ADE20K source ids must be unique")
+            if ignore_index in range(num_classes):
+                raise ValueError("ignore_index must not overlap ten-object train labels 0..10")
+        elif self.class_mode == "150":
+            if num_classes != 150:
+                raise ValueError("150-class mode requires num_classes=150")
+            self._source_to_train = None
+        else:
+            raise ValueError(f"unsupported ADE20K class_mode={self.class_mode!r}")
         self.augment = bool(augment)
         self.crop_size = tuple(crop_size) if crop_size else tuple(size)
         self.scale_range = tuple(scale_range)
@@ -62,9 +102,11 @@ class ADE20K(Dataset):
     def _load_native(self, idx):
         rec = self.ds[idx]
         img = rec["image"].convert("RGB")                 # some ADE20K imgs are grayscale
-        ann = np.asarray(rec["annotation"], np.int64)     # 0=bg, 1..150 = classes
-        seg = ann - 1                                     # 0->-1 (bg), 1..150 -> 0..149
-        seg[seg < 0] = self.ignore_index                  # background -> ignore
+        ann = np.asarray(rec["annotation"], np.int64)     # 0=unlabeled, 1..150=official classes
+        if self.class_mode == "ten_object":
+            seg = remap_ade20k_labels(ann, self.class_mode, self.ignore_index)
+        else:
+            seg = remap_ade20k_labels(ann, self.class_mode, self.ignore_index)
         return img, seg
 
     @staticmethod

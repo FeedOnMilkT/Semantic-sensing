@@ -9,9 +9,12 @@ import torch
 
 
 class SegMeter:
-    def __init__(self, num_classes, ignore_index=255):
+    def __init__(self, num_classes, ignore_index=255, exclude_classes=()):
         self.n = num_classes
         self.ignore = ignore_index
+        self.exclude = tuple(int(c) for c in exclude_classes)
+        if any(c < 0 or c >= num_classes for c in self.exclude):
+            raise ValueError("exclude_classes must be valid class ids")
         self.conf = torch.zeros(num_classes, num_classes, dtype=torch.float64)
 
     @torch.no_grad()
@@ -32,7 +35,10 @@ class SegMeter:
         tp = conf.diag()
         union = conf.sum(0) + conf.sum(1) - tp
         iou = tp / union.clamp(min=1)
-        present = union > 0
+        include = torch.ones(self.n, dtype=torch.bool)
+        if self.exclude:
+            include[list(self.exclude)] = False
+        present = (union > 0) & include
         return {
             "mIoU": float(iou[present].mean()) if present.any() else 0.0,
             "pixel_acc": float(tp.sum() / conf.sum().clamp(min=1)),
@@ -107,7 +113,9 @@ class NormalMeter:
 def build_meter(task, cfg=None):
     cfg = cfg or {}
     if task == "seg":
-        return SegMeter(num_classes=cfg.get("num_classes", 19), ignore_index=cfg.get("ignore_index", 255))
+        return SegMeter(num_classes=cfg.get("num_classes", 19),
+                        ignore_index=cfg.get("ignore_index", 255),
+                        exclude_classes=cfg.get("exclude_classes", ()))
     if task == "depth":
         return DepthMeter(min_depth=cfg.get("min_depth", 1e-3), max_depth=cfg.get("max_depth", 80.0))
     if task == "normal":

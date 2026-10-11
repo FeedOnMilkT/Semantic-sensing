@@ -144,7 +144,7 @@ class MiTB0(nn.Module):
 
     def load_pretrained(self, path):
         import torch
-        sd = torch.load(path, map_location="cpu")
+        sd = torch.load(path, map_location="cpu", weights_only=True)
         sd = sd.get("state_dict", sd)
         remapped = _remap_hf_segformer(sd) if any(k.startswith("segformer.encoder") for k in sd) else sd
         missing, unexpected = self.load_state_dict(remapped, strict=False)

@@ -1,0 +1,25 @@
+# Final paper task: ten foreground objects + one background class.
+# Teacher budget is 160,000 optimization steps, via tools/train.py --max-steps.
+_base_: ade20k_rtformer_paperhead.yaml
+
+num_classes: 11
+
+data:
+  train:
+    args:
+      class_mode: ten_object
+      num_classes: ${num_classes}
+  val:
+    args:
+      class_mode: ten_object
+      num_classes: ${num_classes}
+
+train:
+  amp: false                 # paper §4.3 specifies FP32 training
+
+eval:
+  meters:
+    seg:
+      num_classes: ${num_classes}
+      ignore_index: ${ignore_index}
+      exclude_classes: [0]   # headline mIoU is macro IoU over the ten objects

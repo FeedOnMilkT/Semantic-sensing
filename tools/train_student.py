@@ -41,7 +41,10 @@ def main():
                          "fine-tune receiver tail (CE+Dice)")
     ap.add_argument("--student-ckpt", default=None, help="Stage-1 student .pth to load before Stage 2")
     ap.add_argument("--beta", type=float, default=0.01, help="rate weight (sweep this for the curve)")
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=1e-4,
+                    help="Stage 1 paper value; Stage 2 config has its own AdamW rate")
+    ap.add_argument("--weight-decay", type=float, default=0.01,
+                    help="Stage 1 engineering default; the paper does not specify it")
     ap.add_argument("--aux-lr", type=float, default=1e-3)
     ap.add_argument("--epochs", type=int, default=None,
                     help="train epochs. Default = per-stage config (Stage1 student.stage1_epochs / "
@@ -51,9 +54,14 @@ def main():
     ap.add_argument("--batch-size", type=int, default=None, help="override per-step batch size")
     ap.add_argument("--val-limit", type=int, default=None, help="eval on first N val images (sanity speed)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--resume", action="store_true",
+                    help="Stage 1 only: resume model and optimizer from <out>.last.pth")
     ap.add_argument("--smoke", action="store_true", help="synthetic data + random teacher (wiring check)")
     ap.add_argument("--no-eval", action="store_true")
     args = ap.parse_args()
+
+    if args.resume and (args.stage != 1 or not args.out):
+        ap.error("--resume is Stage 1 only and requires --out so the rolling checkpoint path is known")
 
     device = "cpu" if args.smoke else pick_device()
     cfg = load_config(args.config)
@@ -65,12 +73,12 @@ def main():
         cfg.model.backbone.args.pretrained = None     # ckpt (or random for smoke) supplies weights
     teacher = build_model(cfg.model).to(device).eval()
     if args.teacher_ckpt:
-        state = torch.load(args.teacher_ckpt, map_location="cpu")
+        state = torch.load(args.teacher_ckpt, map_location="cpu", weights_only=False)
         teacher.load_state_dict(state["model"])
         log.info(f"loaded teacher {args.teacher_ckpt}")
     student = build_student(cfg, teacher).to(device)
     if args.student_ckpt:                                 # resume a Stage-1 student (for Stage 2)
-        sd = torch.load(args.student_ckpt, map_location="cpu")
+        sd = torch.load(args.student_ckpt, map_location="cpu", weights_only=False)
         student.load_state_dict(sd["student"])
         log.info(f"loaded student {args.student_ckpt}")
     n_codec = sum(p.numel() for p in student.codec_parameters()) / 1e6
@@ -118,17 +126,27 @@ def main():
                     log_every=cfg.train.get("log_every", 20))
     else:
         tcfg = OmegaConf.create({
-            "optimizer": {"lr": args.lr, "weight_decay": 0.0}, "aux_lr": args.aux_lr,
+            "optimizer": {"lr": args.lr, "weight_decay": args.weight_decay}, "aux_lr": args.aux_lr,
             "scheduler": "poly", "warmup": 0, "grad_clip": 1.0,
             "task_weight": args.task_weight, "ignore_index": ignore_index,
         })
         trainer = StudentTrainer(tcfg, student, beta=args.beta, device=device)
+        start_epoch, global_step = 0, 0
+        rolling_ckpt = os.path.splitext(args.out)[0] + ".last.pth" if args.out else None
+        if args.resume and os.path.isfile(rolling_ckpt):
+            start_epoch, global_step = trainer.load_ckpt(rolling_ckpt)
+            log.info(f"resumed Stage 1 from {rolling_ckpt} at epoch={start_epoch}, step={global_step}")
+        elif args.resume:
+            log.info(f"resume checkpoint not found at {rolling_ckpt}; starting from epoch 0")
         trainer.fit(train_loader, epochs=epochs, max_steps=args.max_steps,
-                    log_every=cfg.train.get("log_every", 20))
+                    log_every=cfg.train.get("log_every", 20), start_epoch=start_epoch,
+                    global_step=global_step, ckpt_path=rolling_ckpt)
 
     # ---- eval: the bpp-mIoU point ----
     if not args.no_eval:
-        m = evaluate_student(student, val_loader, num_classes, device=device, ignore_index=ignore_index)
+        metric_cfg = cfg.eval.get("meters", {}).get("seg", {})
+        m = evaluate_student(student, val_loader, num_classes, device=device, ignore_index=ignore_index,
+                             exclude_classes=metric_cfg.get("exclude_classes", ()))
         log.info(f"[POINT] split={cfg.student.split} beta={args.beta:g} "
                  f"bpp={m['bpp']:.4f} mIoU={m['mIoU']:.4f} pixel_acc={m['pixel_acc']:.4f}")
 

@@ -14,6 +14,8 @@ Only the bottleneck trains — the teacher is frozen inside the student.
 `beta` is a single value per run; a bpp-mIoU curve = sweep beta across runs.
 """
 import time
+import os
+import random
 
 import torch
 import torch.nn.functional as F
@@ -43,10 +45,14 @@ class StudentTrainer:
         self.beta = beta
         self.device = device
         opt = cfg.get("optimizer", {})
-        self.codec_opt = torch.optim.Adam(student.codec_parameters(),
-                                          lr=opt.get("lr", 1e-3),
-                                          weight_decay=opt.get("weight_decay", 0.0))
+        self.codec_opt = torch.optim.AdamW(student.codec_parameters(),
+                                          lr=opt.get("lr", 1e-4),
+                                          weight_decay=opt.get("weight_decay", 0.01))
         self.aux_opt = torch.optim.Adam(student.aux_parameters(), lr=cfg.get("aux_lr", 1e-3))
+        codec_ids = {id(p) for group in self.codec_opt.param_groups for p in group["params"]}
+        aux_ids = {id(p) for group in self.aux_opt.param_groups for p in group["params"]}
+        if codec_ids & aux_ids:
+            raise ValueError("codec and entropy-aux optimizers must update disjoint parameters")
         self.base_lr = self.codec_opt.param_groups[0]["lr"]
         self.sched = cfg.get("scheduler", "poly")
         self.warmup = cfg.get("warmup", 0)
@@ -60,12 +66,42 @@ class StudentTrainer:
             g["lr"] = lr
         return lr
 
-    def fit(self, loader, epochs=1, max_steps=None, log_every=20):
+    def save_ckpt(self, path, epoch, global_step):
+        ckpt = {
+            "student": self.student.state_dict(),
+            "codec_opt": self.codec_opt.state_dict(),
+            "aux_opt": self.aux_opt.state_dict(),
+            "epoch": int(epoch),
+            "global_step": int(global_step),
+            "torch_rng": torch.get_rng_state(),
+            "python_rng": random.getstate(),
+        }
+        if torch.cuda.is_available():
+            ckpt["cuda_rng"] = torch.cuda.get_rng_state_all()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        torch.save(ckpt, tmp)
+        os.replace(tmp, path)
+
+    def load_ckpt(self, path):
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.student.load_state_dict(ckpt["student"])
+        self.codec_opt.load_state_dict(ckpt["codec_opt"])
+        self.aux_opt.load_state_dict(ckpt["aux_opt"])
+        torch.set_rng_state(ckpt["torch_rng"].cpu())
+        random.setstate(ckpt["python_rng"])
+        if "cuda_rng" in ckpt and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(ckpt["cuda_rng"])
+        return int(ckpt.get("epoch", 0)), int(ckpt.get("global_step", 0))
+
+    def fit(self, loader, epochs=1, max_steps=None, log_every=20,
+            start_epoch=0, global_step=None, ckpt_path=None):
         spe = len(loader)
         total = max_steps or epochs * spe
-        step, t0 = 0, time.time()
+        step = start_epoch * spe if global_step is None else int(global_step)
+        t0 = time.time()
         self.student.train()
-        for ep in range(epochs):
+        for ep in range(start_epoch, epochs):
             for batch in loader:
                 if max_steps and step >= max_steps:
                     break
@@ -86,24 +122,31 @@ class StudentTrainer:
                         out["preds"]["seg"], gt, ignore_index=self.ignore_index)
 
                 self.codec_opt.zero_grad(set_to_none=True)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"non-finite Stage 1 objective at step {step}: loss={loss.detach()}")
                 loss.backward()
                 if self.grad_clip:
-                    torch.nn.utils.clip_grad_norm_(self.student.codec_parameters(), self.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(self.student.codec_parameters(), self.grad_clip,
+                                                   error_if_nonfinite=True)
                 self.codec_opt.step()
 
                 aux = self.student.aux_loss()           # train the CDF quantiles separately
+                if not torch.isfinite(aux):
+                    raise FloatingPointError(f"non-finite entropy aux loss at step {step}: aux={aux.detach()}")
                 self.aux_opt.zero_grad(set_to_none=True)
                 aux.backward()
                 self.aux_opt.step()
 
                 if step % log_every == 0:
-                    eta = (time.time() - t0) / max(1, step + 1) * (total - step - 1)
+                    eta = (time.time() - t0) / max(1, step - start_epoch * spe + 1) * max(0, total - step - 1)
                     log.info(f"ep{ep} [{step + 1}/{total}] lr={lr:.2e} beta={self.beta:g} "
                              f"loss={float(loss):.4f} dist={float(distortion):.4f} "
                              f"bpp={float(bpp):.4f} aux={float(aux):.1f} eta={_fmt_eta(eta)}")
                 step += 1
             if max_steps and step >= max_steps:
                 break
+            if ckpt_path:
+                self.save_ckpt(ckpt_path, ep + 1, step)
         return self.student
 
 
@@ -175,11 +218,13 @@ class Stage2Trainer:
 
 
 @torch.no_grad()
-def evaluate_student(student, loader, num_classes, device="cuda", ignore_index=255):
+def evaluate_student(student, loader, num_classes, device="cuda", ignore_index=255,
+                     exclude_classes=()):
     """One pass over val -> the bpp-mIoU point: seg metrics (mIoU/pixel_acc) from the
     frozen tail on reconstructed features, plus mean estimated bpp."""
     student.eval()
-    meter = build_meter("seg", {"num_classes": num_classes, "ignore_index": ignore_index})
+    meter = build_meter("seg", {"num_classes": num_classes, "ignore_index": ignore_index,
+                                "exclude_classes": exclude_classes})
     bpp_sum, n = 0.0, 0
     for batch in loader:
         x = batch["image"].to(device)

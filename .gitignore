@@ -23,6 +23,10 @@ wandb/
 # *.sh
 *.md
 *.txt
+!docs/
+!docs/*.md
+!requirements-imagenet.txt
+!requirements-research.txt
 *.json
 # *.yaml
 *.yml

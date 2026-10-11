@@ -189,7 +189,9 @@ class RTFormer(nn.Module):
         """Load an ImageNet-pretrained backbone state_dict (from tools/pretrain_imagenet.py).
         Accepts a raw RTFormer state_dict or a {'backbone': ...} wrapper. strict=False
         so a classifier head / untrained DAPPM don't block the load."""
-        sd = torch.load(path, map_location="cpu")
+        # Pretraining exports contain only tensors, so keep this safe under
+        # PyTorch versions whose default torch.load policy is weights_only=True.
+        sd = torch.load(path, map_location="cpu", weights_only=True)
         sd = sd.get("backbone", sd.get("model", sd))
         sd = {k[len("backbone."):] if k.startswith("backbone.") else k: v for k, v in sd.items()}
         missing, unexpected = self.load_state_dict(sd, strict=False)

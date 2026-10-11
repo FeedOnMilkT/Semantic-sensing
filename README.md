@@ -1,55 +1,43 @@
 # Semantic Sensing
 
-Semantic Sensing is a PyTorch research codebase for channel-agnostic semantic source coding in split visual perception. The current mainline studies RTFormer-based semantic segmentation on ADE20K, with a learned communication bottleneck inserted between the sender-side convolutional encoder and receiver-side attention tail.
+PyTorch research code for the paper's RTFormer semantic source-coding experiments. The main published path is an ADE20K teacher, followed by a learned feature codec (Stage 1) and a frozen-codec receiver adaptation (Stage 2). Optional ImageNet RTFormer backbone pretraining is a separate initialization step; it is not the paper's ADE20K teacher training recipe.
 
-This repository focuses on source coding for machine perception. It does not simulate wireless channels, inject channel noise, or implement JSCC. The bottleneck produces a byte stream that can be handed to a separate channel coder.
+## Start here
 
-## Current Focus
+- [Paper-to-code alignment and remaining gaps](docs/PAPER_CODE_ALIGNMENT.md)
+- [Standalone Chinese ImageNet server prompt](docs/TRAINING_SERVER_PROMPT_ZH.md)
+- [Repository instructions](AGENTS.md)
 
-- Backbone/task: RTFormer on ADE20K single-task semantic segmentation.
-- Phase 2 split: `mid`, after RTFormer stage3 at the convolution-to-attention boundary.
-- Payload: dual features `(128@1/8, 256@1/16)` compressed by `rtformer_distill`.
-- Bottleneck: two mean-scale hyperpriors packed into one byte container.
-- Training: Stage 1 feature distillation plus rate loss, then Stage 2 receiver-tail task fine-tuning.
+## Local checks
 
-Multi-task depth/normal support is deferred, but the model framework still keeps dict heads and interchangeable task losses.
-
-## Repository Layout
-
-```text
-configs/        YAML experiment configs and Phase 2 split settings
-src/            models, datasets, losses, training loops, metrics
-src/models/     RTFormer, SplitStudent, bottlenecks, heads, decoders
-tools/          training, evaluation, smoke-test, export utilities
-tests/          split equivalence, bottleneck contract, bitstream tests
-notes/          research notes and progress logs
-deploy/hailo/   Hailo deployment helpers
-```
-
-## Quick Checks
-
-Run from the repository root:
+Python 3.11 is the supported starting point. Install the CUDA-specific PyTorch wheel separately on a GPU server after checking its GPU and driver; `requirements-research.txt` contains the additional research dependencies. On this M2 Pro workstation, use an isolated CPU/MPS environment and do not start a real training run.
 
 ```bash
-python tools/smoke_test.py
-python tools/smoke_student.py
-python tools/smoke_student_split.py
-CUDA_VISIBLE_DEVICES="" PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/ -q
+uv venv --python 3.11 /tmp/semantic-sensing-check
+uv pip install --python /tmp/semantic-sensing-check/bin/python -r requirements-research.txt torch torchvision
+/tmp/semantic-sensing-check/bin/python tools/pretrain_imagenet.py --help
+OMP_NUM_THREADS=2 /tmp/semantic-sensing-check/bin/python tools/pretrain_imagenet.py \
+  --device cpu --precision fp32 --synthetic-data --dry-run --batch-size 2 \
+  --workers 0 --img-size 64 --out /tmp/imagenet-smoke.pth
 ```
 
-The Pytest command is CPU-oriented and avoids a broken external plugin entry point in the current container image.
+The synthetic CLI fixture executes one forward/backward optimizer step and one validation batch, then exits without writing weights. It checks wiring only, not ImageNet accuracy or CUDA/BF16 support.
 
-## Phase 2 Example
+Real data training entry points:
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python tools/train_student.py configs/phase2_mid_stage1.yaml \
-  --teacher-ckpt /data/sidney/checkpoints/semantic-sensing/ade20k/ade20k_rtformer_paperhead.pth \
-  --beta 0.01 \
-  --out /data/sidney/checkpoints/semantic-sensing/students/mid_b0.01_s1.pth
+python tools/train.py configs/ade20k_rtformer_ten_object.yaml --max-steps 160000 \
+  --out /data/checkpoints/semantic-sensing/ade20k_teacher.pth
+python tools/train_student.py configs/phase2_mid_fused_stage1.yaml \
+  --teacher-ckpt /data/checkpoints/ade20k_teacher.pth --beta 0.01 \
+  --out /data/checkpoints/mid_fused_s1.pth
+python tools/train_student.py configs/phase2_mid_fused_stage2.yaml --stage 2 \
+  --teacher-ckpt /data/checkpoints/ade20k_teacher.pth \
+  --student-ckpt /data/checkpoints/mid_fused_s1.pth
 ```
 
-Use `/data/sidney/` for checkpoints, datasets, exported ONNX/HAR files, and long logs. Keep `/workspace` for code, configs, and lightweight documentation.
+The first command follows the paper's 160,000-step teacher budget. The Stage 1/2 commands require compatible checkpoints and dataset access; see the alignment note before using configs, since older experiment files intentionally retain 150-class settings.
 
-## Contributor Notes
+## Repository map
 
-Read `AGENTS.md`, `CLAUDE.md`, and the latest files in `notes/` before making architectural changes. The project intentionally uses plain PyTorch, OmegaConf YAML composition, and explicit `build_X(cfg)` factories instead of registry/decorator frameworks.
+`src/` contains models, datasets, losses, training loops, and metrics; `configs/` contains experiment recipes; `tools/` contains runnable training and validation utilities; `tests/` contains focused checks. `notes/` retains selected source-paper notes and a historical ImageNet experiment record. Datasets, caches, logs, and weights belong outside the repository.

@@ -1,0 +1,6 @@
+# Install the CUDA-specific torch/torchvision pair separately from the official
+# PyTorch wheel index after checking the server's GPU architecture and driver.
+numpy>=2,<3
+Pillow>=10
+datasets>=4,<6
+huggingface_hub>=0.30

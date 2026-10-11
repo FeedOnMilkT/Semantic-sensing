@@ -117,7 +117,7 @@ class Trainer:
 
     def load_ckpt(self, path):
         """Restore all state in-place; return (next_epoch, global_step) to resume from."""
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt["model"])
         self.loss.load_state_dict(ckpt["loss"])
         self.opt.load_state_dict(ckpt["opt"])

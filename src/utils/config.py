@@ -16,19 +16,23 @@ def _load_with_bases(path, _seen=None):
     if path in _seen:
         raise ValueError(f"circular _base_ include at {path}")
     _seen.add(path)
+    try:
+        cfg = OmegaConf.load(path)
+        bases = cfg.pop("_base_", None)
+        if bases is None:
+            return cfg
+        if isinstance(bases, str):
+            bases = [bases]
 
-    cfg = OmegaConf.load(path)
-    bases = cfg.pop("_base_", None)
-    if bases is None:
-        return cfg
-    if isinstance(bases, str):
-        bases = [bases]
-
-    here = os.path.dirname(path)
-    merged = OmegaConf.create({})
-    for b in bases:
-        merged = OmegaConf.merge(merged, _load_with_bases(os.path.join(here, b), _seen))
-    return OmegaConf.merge(merged, cfg)
+        here = os.path.dirname(path)
+        merged = OmegaConf.create({})
+        for b in bases:
+            merged = OmegaConf.merge(merged, _load_with_bases(os.path.join(here, b), _seen))
+        return OmegaConf.merge(merged, cfg)
+    finally:
+        # Track only the active recursion stack: two sibling configs may share a
+        # common base without forming a cycle.
+        _seen.remove(path)
 
 
 def load_config(path, cli_overrides=None):

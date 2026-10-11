@@ -1,0 +1,5 @@
+-r requirements-imagenet.txt
+omegaconf>=2.3,<3
+compressai>=1.2.8
+tqdm>=4.66
+pytest>=8
